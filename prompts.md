@@ -15,3 +15,12 @@ mlx-rs = { git = "https://github.com/blossom-slopware/mlx-rs.git", rev = "b81194
 使用这个音频进行测试：/Users/daisy/develop/fcpe-mlxrs/audio/huaxue.wav
 checkpoint: /Users/daisy/develop/fcpe-mlxrs/checkpoint/fcpe.pt
 不允许进入plan mode
+
+使用任何你认为合适的第三方库。
+如果你不清楚某个库的API，你需要查看源码或者文档。不要上网查文档，本地的库缓存有源码
+
+注意.pt权重可能需要格式转换才能被mlx读取。
+
+---
+
+将python和Rust的输出f0曲线画在一张图中，用不同的颜色。注意不发声段不要画出来

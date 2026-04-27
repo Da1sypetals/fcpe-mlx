@@ -1,6 +1,11 @@
 [package]
 name = "fcpe-mlxrs"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
+mlx-rs = { git = "https://github.com/blossom-slopware/mlx-rs.git", rev = "b81194a47c2c6ba4ecb0cf370e4f0d941f52dd5d", features = ["accelerate", "metal"] }
+numpy = "0.21"
+ndarray = "0.16"
+anyhow = "1.0"
+hound = "3.5"
