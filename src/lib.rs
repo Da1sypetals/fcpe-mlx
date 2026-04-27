@@ -1,21 +1,20 @@
 use mlx_rs::fft::rfft;
 use mlx_rs::module::Module;
 use mlx_rs::nn::{Conv1d, GroupNorm, LayerNorm, Linear};
-use mlx_rs::ops::indexing::{argmax_axis, take_along_axis, IndexOp, IntoStrideBy};
+use mlx_rs::ops::indexing::{IndexOp, IntoStrideBy, argmax_axis, take_along_axis};
 use mlx_rs::ops::{
     as_strided, concatenate_axis, le, maximum, minimum, pad, sqrt, square, transpose_axes, which,
 };
-use mlx_rs::{array, Array};
-use safetensors::tensor::TensorView;
+use mlx_rs::{Array, array};
 use safetensors::SafeTensors;
+use safetensors::tensor::TensorView;
 use std::collections::HashMap;
 
 pub fn tensor_to_array(tensor: &TensorView) -> Array {
     let shape: Vec<i32> = tensor.shape().iter().map(|&s| s as i32).collect();
     let data = tensor.data();
-    let f32_slice: &[f32] = unsafe {
-        std::slice::from_raw_parts(data.as_ptr() as *const f32, data.len() / 4)
-    };
+    let f32_slice: &[f32] =
+        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, data.len() / 4) };
     Array::from_slice(f32_slice, &shape)
 }
 
@@ -32,7 +31,10 @@ pub fn load_weights_safetensors(path: &str) -> HashMap<String, Array> {
 }
 
 fn get_weight(weights: &HashMap<String, Array>, key: &str) -> Array {
-    weights.get(key).unwrap_or_else(|| panic!("missing weight: {}", key)).clone()
+    weights
+        .get(key)
+        .unwrap_or_else(|| panic!("missing weight: {}", key))
+        .clone()
 }
 
 fn apply_weight_norm(weight_v: &Array, weight_g: &Array) -> Array {
@@ -117,10 +119,8 @@ impl CFNaiveMelPE {
 
         let mut input_conv1 = Conv1d::new(input_channels, hidden_dims, 3).unwrap();
         input_conv1.padding = 1;
-        input_conv1.weight.value = transpose_axes(
-            &get_weight(&weights, "input_stack_0_weight"),
-            &[0, 2, 1],
-        ).unwrap();
+        input_conv1.weight.value =
+            transpose_axes(&get_weight(&weights, "input_stack_0_weight"), &[0, 2, 1]).unwrap();
         input_conv1.bias.value = Some(get_weight(&weights, "input_stack_0_bias"));
 
         let mut input_gn = GroupNorm::new(4, hidden_dims).unwrap();
@@ -130,10 +130,8 @@ impl CFNaiveMelPE {
 
         let mut input_conv2 = Conv1d::new(hidden_dims, hidden_dims, 3).unwrap();
         input_conv2.padding = 1;
-        input_conv2.weight.value = transpose_axes(
-            &get_weight(&weights, "input_stack_3_weight"),
-            &[0, 2, 1],
-        ).unwrap();
+        input_conv2.weight.value =
+            transpose_axes(&get_weight(&weights, "input_stack_3_weight"), &[0, 2, 1]).unwrap();
         input_conv2.bias.value = Some(get_weight(&weights, "input_stack_3_bias"));
 
         let mut conformer_layers = Vec::new();
@@ -144,23 +142,41 @@ impl CFNaiveMelPE {
             let prefix = format!("net_encoder_layers_{}", i);
 
             let mut cm = ConformerConvModule::new(hidden_dims, inner_dim);
-            cm.norm.weight.value = Some(get_weight(&weights, &format!("{}_conformer_net_0_weight", prefix)));
-            cm.norm.bias.value = Some(get_weight(&weights, &format!("{}_conformer_net_0_bias", prefix)));
+            cm.norm.weight.value = Some(get_weight(
+                &weights,
+                &format!("{}_conformer_net_0_weight", prefix),
+            ));
+            cm.norm.bias.value = Some(get_weight(
+                &weights,
+                &format!("{}_conformer_net_0_bias", prefix),
+            ));
             cm.conv1.weight.value = transpose_axes(
                 &get_weight(&weights, &format!("{}_conformer_net_2_weight", prefix)),
                 &[0, 2, 1],
-            ).unwrap();
-            cm.conv1.bias.value = Some(get_weight(&weights, &format!("{}_conformer_net_2_bias", prefix)));
+            )
+            .unwrap();
+            cm.conv1.bias.value = Some(get_weight(
+                &weights,
+                &format!("{}_conformer_net_2_bias", prefix),
+            ));
             cm.dw_conv.weight.value = transpose_axes(
                 &get_weight(&weights, &format!("{}_conformer_net_4_conv_weight", prefix)),
                 &[0, 2, 1],
-            ).unwrap();
-            cm.dw_conv.bias.value = Some(get_weight(&weights, &format!("{}_conformer_net_4_conv_bias", prefix)));
+            )
+            .unwrap();
+            cm.dw_conv.bias.value = Some(get_weight(
+                &weights,
+                &format!("{}_conformer_net_4_conv_bias", prefix),
+            ));
             cm.conv2.weight.value = transpose_axes(
                 &get_weight(&weights, &format!("{}_conformer_net_6_weight", prefix)),
                 &[0, 2, 1],
-            ).unwrap();
-            cm.conv2.bias.value = Some(get_weight(&weights, &format!("{}_conformer_net_6_bias", prefix)));
+            )
+            .unwrap();
+            cm.conv2.bias.value = Some(get_weight(
+                &weights,
+                &format!("{}_conformer_net_6_bias", prefix),
+            ));
 
             conformer_layers.push(cm);
 
@@ -253,15 +269,20 @@ impl CFNaiveMelPE {
             &le(&confident, &Array::from(threshold)).unwrap(),
             &inf_neg,
             &one,
-        ).unwrap();
+        )
+        .unwrap();
         rtn = rtn.multiply(&mask).unwrap();
         rtn
     }
 
     pub fn cent_to_f0(&self, cent: &Array) -> Array {
-        let exp_term = cent.divide(&Array::from(1200.0f32)).unwrap()
-            .multiply(&Array::from(2.0f32.ln())).unwrap()
-            .exp().unwrap();
+        let exp_term = cent
+            .divide(&Array::from(1200.0f32))
+            .unwrap()
+            .multiply(&Array::from(2.0f32.ln()))
+            .unwrap()
+            .exp()
+            .unwrap();
         Array::from(10.0f32).multiply(&exp_term).unwrap()
     }
 
@@ -313,7 +334,9 @@ fn mel_frequencies(n_mels: i32, fmin: f32, fmax: f32) -> Vec<f32> {
     let min_mel = hz_to_mel(fmin);
     let max_mel = hz_to_mel(fmax);
     let step = (max_mel - min_mel) / (n_mels - 1) as f32;
-    (0..n_mels).map(|i| mel_to_hz(min_mel + step * i as f32)).collect()
+    (0..n_mels)
+        .map(|i| mel_to_hz(min_mel + step * i as f32))
+        .collect()
 }
 
 pub fn build_mel_filterbank(sr: f32, n_fft: i32, n_mels: i32, fmin: f32, fmax: f32) -> Array {
@@ -328,7 +351,7 @@ pub fn build_mel_filterbank(sr: f32, n_fft: i32, n_mels: i32, fmin: f32, fmax: f
         let fdiff_upper = mel_f[i + 2] - mel_f[i + 1];
 
         for j in 0..n_freqs {
-            let lower = - (mel_f[i] - fftfreqs[j]) / fdiff_lower;
+            let lower = -(mel_f[i] - fftfreqs[j]) / fdiff_lower;
             let upper = (mel_f[i + 2] - fftfreqs[j]) / fdiff_upper;
             let w = lower.min(upper).max(0.0);
             weights[i * n_freqs + j] = w;
@@ -356,15 +379,7 @@ fn compute_resample_kernel(
     input: &[f32],
     input_sr: usize,
     output_sr: usize,
-) -> Option<(
-    Vec<f32>,
-    Vec<Vec<f32>>,
-    usize,
-    usize,
-    usize,
-    usize,
-    usize,
-)> {
+) -> Option<(Vec<f32>, Vec<Vec<f32>>, usize, usize, usize, usize, usize)> {
     if input_sr == output_sr {
         return None;
     }
@@ -399,9 +414,15 @@ fn compute_resample_kernel(
             let mut t = (t_offset + idx_val) * base_freq;
             t = t.clamp(-lowpass_filter_width as f64, lowpass_filter_width as f64);
 
-            let window = (t * std::f64::consts::PI / lowpass_filter_width as f64 / 2.0).cos().powi(2);
+            let window = (t * std::f64::consts::PI / lowpass_filter_width as f64 / 2.0)
+                .cos()
+                .powi(2);
             let t_pi = t * std::f64::consts::PI;
-            let sinc = if t_pi.abs() < 1e-10 { 1.0 } else { t_pi.sin() / t_pi };
+            let sinc = if t_pi.abs() < 1e-10 {
+                1.0
+            } else {
+                t_pi.sin() / t_pi
+            };
             let scale = base_freq / orig_freq;
             kernel[j][k] = sinc * window * scale;
         }
@@ -417,9 +438,20 @@ fn compute_resample_kernel(
     let mut padded = vec![0.0f32; padded_len];
     padded[pad_left..pad_left + input_len].copy_from_slice(input);
 
-    let kernel_f32: Vec<Vec<f32>> = kernel.iter().map(|kj| kj.iter().map(|&v| v as f32).collect()).collect();
+    let kernel_f32: Vec<Vec<f32>> = kernel
+        .iter()
+        .map(|kj| kj.iter().map(|&v| v as f32).collect())
+        .collect();
 
-    Some((padded, kernel_f32, orig_freq as usize, new_freq_i, kernel_len, target_len, output_len))
+    Some((
+        padded,
+        kernel_f32,
+        orig_freq as usize,
+        new_freq_i,
+        kernel_len,
+        target_len,
+        output_len,
+    ))
 }
 
 pub fn resample_audio(input: &[f32], input_sr: usize, output_sr: usize) -> Vec<f32> {
@@ -564,10 +596,26 @@ pub fn resample_audio_metal(input: &[f32], input_sr: usize, output_sr: usize) ->
     let nf = new_freq_i as i32;
     let tl = target_len as i32;
 
-    encoder.set_bytes(3, std::mem::size_of::<i32>() as u64, &kl as *const _ as *const _);
-    encoder.set_bytes(4, std::mem::size_of::<i32>() as u64, &of as *const _ as *const _);
-    encoder.set_bytes(5, std::mem::size_of::<i32>() as u64, &nf as *const _ as *const _);
-    encoder.set_bytes(6, std::mem::size_of::<i32>() as u64, &tl as *const _ as *const _);
+    encoder.set_bytes(
+        3,
+        std::mem::size_of::<i32>() as u64,
+        &kl as *const _ as *const _,
+    );
+    encoder.set_bytes(
+        4,
+        std::mem::size_of::<i32>() as u64,
+        &of as *const _ as *const _,
+    );
+    encoder.set_bytes(
+        5,
+        std::mem::size_of::<i32>() as u64,
+        &nf as *const _ as *const _,
+    );
+    encoder.set_bytes(
+        6,
+        std::mem::size_of::<i32>() as u64,
+        &tl as *const _ as *const _,
+    );
 
     encoder.set_threadgroup_memory_length(0, shared_mem_bytes);
 
@@ -604,7 +652,11 @@ fn reflect_pad_1d_last_dim(x: &Array, pad_left: i32, pad_right: i32) -> Array {
     if parts.len() == 1 {
         parts[0].clone()
     } else {
-        concatenate_axis(&parts.iter().map(|a| a).collect::<Vec<_>>()[..], shape.len() as i32 - 1).unwrap()
+        concatenate_axis(
+            &parts.iter().map(|a| a).collect::<Vec<_>>()[..],
+            shape.len() as i32 - 1,
+        )
+        .unwrap()
     }
 }
 
@@ -627,8 +679,15 @@ pub fn wav_to_mel(wav: &Array, mel_basis: &Array, hann_window: &Array) -> Array 
     let y_pad = if mode_reflect {
         reflect_pad_1d_last_dim(wav, pad_left, pad_right)
     } else {
-        pad(&wav.reshape(&[batch, t, 1]).unwrap(), &[(0, 0), (pad_left, pad_right), (0, 0)], Array::from(0.0f32), Some(mlx_rs::ops::PadMode::Constant)).unwrap()
-            .reshape(&[batch, t + pad_left + pad_right]).unwrap()
+        pad(
+            &wav.reshape(&[batch, t, 1]).unwrap(),
+            &[(0, 0), (pad_left, pad_right), (0, 0)],
+            Array::from(0.0f32),
+            Some(mlx_rs::ops::PadMode::Constant),
+        )
+        .unwrap()
+        .reshape(&[batch, t + pad_left + pad_right])
+        .unwrap()
     };
 
     let t_padded = y_pad.shape()[1];
@@ -639,7 +698,8 @@ pub fn wav_to_mel(wav: &Array, mel_basis: &Array, hann_window: &Array) -> Array 
         &[batch, n_frames, win_size],
         &[t_padded as i64, hop_length as i64, 1],
         0,
-    ).unwrap();
+    )
+    .unwrap();
 
     let hann_reshaped = hann_window.reshape(&[1, 1, win_size]).unwrap();
     let windowed = frames.multiply(&hann_reshaped).unwrap();
@@ -647,7 +707,15 @@ pub fn wav_to_mel(wav: &Array, mel_basis: &Array, hann_window: &Array) -> Array 
     let spec_complex = rfft(&windowed, n_fft, None).unwrap();
     let real = spec_complex.real().unwrap();
     let imag = spec_complex.imag().unwrap();
-    let mag = sqrt(&square(&real).unwrap().add(&square(&imag).unwrap()).unwrap().add(&Array::from(1e-9f32)).unwrap()).unwrap();
+    let mag = sqrt(
+        &square(&real)
+            .unwrap()
+            .add(&square(&imag).unwrap())
+            .unwrap()
+            .add(&Array::from(1e-9f32))
+            .unwrap(),
+    )
+    .unwrap();
 
     let mag_t = transpose_axes(&mag, &[0, 2, 1]).unwrap();
 
@@ -655,14 +723,22 @@ pub fn wav_to_mel(wav: &Array, mel_basis: &Array, hann_window: &Array) -> Array 
     let spec_mel = mel_basis_3d.matmul(&mag_t).unwrap();
 
     let clamped = maximum(&spec_mel, &Array::from(clip_val)).unwrap();
-    let compressed = clamped.multiply(&Array::from(1.0f32)).unwrap().log().unwrap();
+    let compressed = clamped
+        .multiply(&Array::from(1.0f32))
+        .unwrap()
+        .log()
+        .unwrap();
 
     let spec_out = transpose_axes(&compressed, &[0, 2, 1]).unwrap();
 
     let target_n_frames = t / hop_length + 1;
     let mel_final = if target_n_frames > spec_out.shape()[1] {
         let last_frame = spec_out.index((.., -1i32, ..));
-        concatenate_axis(&[&spec_out, &last_frame.reshape(&[batch, 1, n_mels]).unwrap()], 1).unwrap()
+        concatenate_axis(
+            &[&spec_out, &last_frame.reshape(&[batch, 1, n_mels]).unwrap()],
+            1,
+        )
+        .unwrap()
     } else if target_n_frames < spec_out.shape()[1] {
         spec_out.index((.., ..target_n_frames as i32, ..))
     } else {
@@ -681,23 +757,17 @@ fn batch_interp_with_replacement_detach_gpu(uv: &Array, f0: &Array) -> Array {
     // f0: (B, T) f32, already zeroed for uv frames
 
     // Create position indices: (1, T)
-    let x = mlx_rs::ops::arange::<_, f32>(0.0, t as f32, None).unwrap()
-        .reshape(&[1, t]).unwrap();
+    let x = mlx_rs::ops::arange::<_, f32>(0.0, t as f32, None)
+        .unwrap()
+        .reshape(&[1, t])
+        .unwrap();
 
     // voiced_mask: (B, T), 1.0 for voiced, 0.0 for unvoiced
-    let voiced_mask = mlx_rs::ops::r#where(
-        uv,
-        &Array::from(0.0f32),
-        &Array::from(1.0f32),
-    ).unwrap();
+    let voiced_mask = mlx_rs::ops::r#where(uv, &Array::from(0.0f32), &Array::from(1.0f32)).unwrap();
 
     // voiced_pos: position where voiced, -inf where unvoiced (so cummax ignores them)
     let neg_inf = Array::from(f32::NEG_INFINITY);
-    let voiced_pos = mlx_rs::ops::r#where(
-        &voiced_mask,
-        &x,
-        &neg_inf,
-    ).unwrap();
+    let voiced_pos = mlx_rs::ops::r#where(&voiced_mask, &x, &neg_inf).unwrap();
 
     // left_pos: forward cummax, gives position of last voiced point seen so far
     let left_pos = voiced_pos.cummax(1, None, Some(true)).unwrap();
@@ -707,28 +777,40 @@ fn batch_interp_with_replacement_detach_gpu(uv: &Array, f0: &Array) -> Array {
 
     // For positions with no voiced neighbor, cummax returns -inf
     // Find the first and last voiced positions globally
-    let first_voiced = argmax_axis(&voiced_mask, 1, false).unwrap()
-        .as_type::<f32>().unwrap();
+    let first_voiced = argmax_axis(&voiced_mask, 1, false)
+        .unwrap()
+        .as_type::<f32>()
+        .unwrap();
     let rev_voiced_mask = mlx_rs::ops::indexing::take_along_axis_device(
         &voiced_mask,
-        &mlx_rs::ops::arange::<_, i32>((t - 1) as i32, -1i32, Some(-1i32)).unwrap().reshape(&[1, t]).unwrap(),
+        &mlx_rs::ops::arange::<_, i32>((t - 1) as i32, -1i32, Some(-1i32))
+            .unwrap()
+            .reshape(&[1, t])
+            .unwrap(),
         1,
         mlx_rs::StreamOrDevice::default(),
-    ).unwrap();
-    let last_voiced_rev = argmax_axis(&rev_voiced_mask, 1, false).unwrap()
-        .as_type::<f32>().unwrap();
-    let last_voiced = Array::from((t - 1) as f32).subtract(&last_voiced_rev).unwrap();
+    )
+    .unwrap();
+    let last_voiced_rev = argmax_axis(&rev_voiced_mask, 1, false)
+        .unwrap()
+        .as_type::<f32>()
+        .unwrap();
+    let last_voiced = Array::from((t - 1) as f32)
+        .subtract(&last_voiced_rev)
+        .unwrap();
 
     let left_pos = mlx_rs::ops::r#where(
         &mlx_rs::ops::eq(&left_pos, &neg_inf).unwrap(),
         &first_voiced,
         &left_pos,
-    ).unwrap();
+    )
+    .unwrap();
     let right_pos = mlx_rs::ops::r#where(
         &mlx_rs::ops::eq(&right_pos, &neg_inf).unwrap(),
         &last_voiced,
         &right_pos,
-    ).unwrap();
+    )
+    .unwrap();
 
     // Convert to integer indices
     let left_idx_i = left_pos.as_type::<i32>().unwrap();
@@ -742,7 +824,7 @@ fn batch_interp_with_replacement_detach_gpu(uv: &Array, f0: &Array) -> Array {
     let right_idx_i = mlx_rs::ops::maximum(&right_idx_i, &zero).unwrap();
     let right_idx_i = mlx_rs::ops::minimum(&right_idx_i, &max_idx).unwrap();
 
-    // Use index op for gathering: f0[b, left_idx] 
+    // Use index op for gathering: f0[b, left_idx]
     // mlx index: f0.index((.., left_idx_i)) should work for per-batch indexing
     // But mlx-rs indexing may not support Array indices directly
     // Alternative: use take_along_axis with proper shapes
@@ -756,46 +838,58 @@ fn batch_interp_with_replacement_detach_gpu(uv: &Array, f0: &Array) -> Array {
     // But take_along_axis expects indices to have the same shape as input
     // and gathers along the specified axis
     // We need to expand indices to (B, T, 1) and input to (B, T, 1) for axis=2? No.
-    
+
     // Actually, for take_along_axis with axis=1:
     // input: (B, T), indices: (B, T), output: (B, T)
     // Each element in output is input[b, indices[b, t]]
     // This is exactly what we need!
-    
-    let f0_left = mlx_rs::ops::indexing::take_along_axis_device(&f0, &left_idx_i, 1, mlx_rs::StreamOrDevice::default()).unwrap();
-    let f0_right = mlx_rs::ops::indexing::take_along_axis_device(&f0, &right_idx_i, 1, mlx_rs::StreamOrDevice::default()).unwrap();
+
+    let f0_left = mlx_rs::ops::indexing::take_along_axis_device(
+        &f0,
+        &left_idx_i,
+        1,
+        mlx_rs::StreamOrDevice::default(),
+    )
+    .unwrap();
+    let f0_right = mlx_rs::ops::indexing::take_along_axis_device(
+        &f0,
+        &right_idx_i,
+        1,
+        mlx_rs::StreamOrDevice::default(),
+    )
+    .unwrap();
 
     // Position values as float
     let left_pos_f = left_pos;
     let right_pos_f = right_pos;
 
     // x positions broadcasted to (B, T)
-    let x_b = mlx_rs::ops::broadcast_to_device(&x, &[b, t], mlx_rs::StreamOrDevice::default()).unwrap();
+    let x_b =
+        mlx_rs::ops::broadcast_to_device(&x, &[b, t], mlx_rs::StreamOrDevice::default()).unwrap();
 
     // Linear interpolation
     let dx = right_pos_f.subtract(&left_pos_f).unwrap();
     let dx_safe = mlx_rs::ops::maximum(&dx, &Array::from(1e-8f32)).unwrap();
 
-    let ratio = x_b.subtract(&left_pos_f).unwrap()
-        .divide(&dx_safe).unwrap();
+    let ratio = x_b.subtract(&left_pos_f).unwrap().divide(&dx_safe).unwrap();
     let ratio = mlx_rs::ops::minimum(&ratio, &Array::from(1.0f32)).unwrap();
     let ratio = mlx_rs::ops::maximum(&ratio, &Array::from(0.0f32)).unwrap();
 
-    let interp = f0_left.add(
-        &f0_right.subtract(&f0_left).unwrap()
-            .multiply(&ratio).unwrap()
-    ).unwrap();
+    let interp = f0_left
+        .add(
+            &f0_right
+                .subtract(&f0_left)
+                .unwrap()
+                .multiply(&ratio)
+                .unwrap(),
+        )
+        .unwrap();
 
     // Where voiced (not uv), use original f0; where unvoiced, use interp
     mlx_rs::ops::r#where(uv, &interp, f0).unwrap()
 }
 
-pub fn postprocess_f0(
-    f0: &Array,
-    f0_min: f32,
-    f0_max: Option<f32>,
-    interp_uv: bool,
-) -> Array {
+pub fn postprocess_f0(f0: &Array, f0_min: f32, f0_max: Option<f32>, interp_uv: bool) -> Array {
     let mut f0 = f0.clone();
 
     let uv = mlx_rs::ops::lt(&f0, &Array::from(f0_min)).unwrap();
@@ -809,7 +903,8 @@ pub fn postprocess_f0(
         let uv_bool = uv.reshape(&[uv.shape()[0], uv.shape()[1]]).unwrap();
         let f0_squeezed = f0.reshape(&[f0.shape()[0], f0.shape()[1]]).unwrap();
         f0 = batch_interp_with_replacement_detach_gpu(&uv_bool, &f0_squeezed)
-            .reshape(&[f0.shape()[0], f0.shape()[1], 1]).unwrap();
+            .reshape(&[f0.shape()[0], f0.shape()[1], 1])
+            .unwrap();
     }
 
     if let Some(fmax) = f0_max {
@@ -817,9 +912,9 @@ pub fn postprocess_f0(
             &mlx_rs::ops::gt(&f0, &Array::from(fmax)).unwrap(),
             &Array::from(fmax),
             &f0,
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     f0
 }
-
