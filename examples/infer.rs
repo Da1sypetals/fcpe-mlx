@@ -1,6 +1,6 @@
 use fcpe_mlxrs::{
     build_hann_window, build_mel_filterbank, load_weights_safetensors, postprocess_f0, resample_audio,
-    resample_audio_metal, wav_to_mel_profiled, CFNaiveMelPE,
+    resample_audio_metal, wav_to_mel, CFNaiveMelPE,
 };
 use mlx_rs::Array;
 
@@ -49,7 +49,7 @@ fn main() {
 
     let mel_basis = build_mel_filterbank(16000.0, 1024, 128, 0.0, 8000.0);
     let hann_window = build_hann_window(1024);
-    let mel = wav_to_mel_profiled(&audio_res, &mel_basis, &hann_window);
+    let mel = wav_to_mel(&audio_res, &mel_basis, &hann_window);
     println!("mel shape: {:?}", mel.shape());
 
     let mut model = CFNaiveMelPE::new(weights.clone());
@@ -74,7 +74,7 @@ fn main() {
         };
         let mel_basis = build_mel_filterbank(16000.0, 1024, 128, 0.0, 8000.0);
         let hann_window = build_hann_window(1024);
-        let mel = wav_to_mel_profiled(&audio_r, &mel_basis, &hann_window);
+        let mel = wav_to_mel(&audio_r, &mel_basis, &hann_window);
         let mut model = CFNaiveMelPE::new(weights.clone());
         let f0 = model.infer(&mel, "local_argmax", 0.006);
         let _ = postprocess_f0(&f0, model.f0_min, Some(model.f0_max), true);
@@ -90,7 +90,7 @@ fn main() {
         };
         let mel_basis = build_mel_filterbank(16000.0, 1024, 128, 0.0, 8000.0);
         let hann_window = build_hann_window(1024);
-        let mel = wav_to_mel_profiled(&audio_r, &mel_basis, &hann_window);
+        let mel = wav_to_mel(&audio_r, &mel_basis, &hann_window);
         let mut model = CFNaiveMelPE::new(weights.clone());
         let f0 = model.infer(&mel, "local_argmax", 0.006);
         let _ = postprocess_f0(&f0, model.f0_min, Some(model.f0_max), true);
