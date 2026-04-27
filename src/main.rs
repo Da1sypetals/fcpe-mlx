@@ -522,6 +522,28 @@ fn main() {
     println!("f0 min: {:?}", f0_processed.min(None).unwrap().item::<f32>());
     println!("f0 max: {:?}", f0_processed.max(None).unwrap().item::<f32>());
 
+    // Benchmark model inference
+    let n = 100;
+    let mut times = Vec::with_capacity(n);
+
+    // Warmup
+    for _ in 0..10 {
+        let _ = model.infer(&mel, "local_argmax", 0.006);
+    }
+
+    for _ in 0..n {
+        let t0 = std::time::Instant::now();
+        let _ = model.infer(&mel, "local_argmax", 0.006);
+        let t1 = std::time::Instant::now();
+        times.push(t1.duration_since(t0).as_secs_f64() * 1000.0);
+    }
+
+    let avg = times.iter().sum::<f64>() / times.len() as f64;
+    let min = times.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+    let max = times.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+    println!("Rust mlx-rs infer: {:.3} ms per run (avg of {})", avg, n);
+    println!("  min: {:.3} ms, max: {:.3} ms", min, max);
+
     // Compare with reference if available
     if let Ok(ref_mel) = Array::load_numpy("/Users/daisy/develop/fcpe-mlxrs/ref_mel.npy") {
         let diff_mel = (&mel - &ref_mel).abs().unwrap();
