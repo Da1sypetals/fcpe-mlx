@@ -1,12 +1,13 @@
 use mlx_rs::fft::rfft;
 use mlx_rs::module::Module;
 use mlx_rs::nn::{Conv1d, GroupNorm, LayerNorm, Linear};
-use mlx_rs::ops::indexing::{IndexOp, IntoStrideBy, take_along_axis, argmax_axis};
+use mlx_rs::ops::indexing::{argmax_axis, take_along_axis, IndexOp, IntoStrideBy};
 use mlx_rs::ops::{
     as_strided, concatenate_axis, le, maximum, minimum, pad, sqrt, square, transpose_axes, which,
 };
 use mlx_rs::{array, Array};
-use safetensors::{SafeTensors, tensor::TensorView};
+use safetensors::tensor::TensorView;
+use safetensors::SafeTensors;
 use std::collections::HashMap;
 
 pub fn tensor_to_array(tensor: &TensorView) -> Array {
@@ -18,36 +19,26 @@ pub fn tensor_to_array(tensor: &TensorView) -> Array {
     Array::from_slice(f32_slice, &shape)
 }
 
-pub fn load_f32_bin(path: &str) -> Array {
+pub fn load_weights_safetensors(path: &str) -> HashMap<String, Array> {
     let data = std::fs::read(path).unwrap();
-    let ndims = i32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    let mut shape = Vec::new();
-    let mut offset = 4;
-    for _ in 0..ndims {
-        let dim = i32::from_le_bytes([
-            data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
-        ]);
-        shape.push(dim);
-        offset += 4;
+    let tensors = SafeTensors::deserialize(&data).unwrap();
+    let mut weights = HashMap::new();
+    for name in tensors.names() {
+        let tensor = tensors.tensor(name).unwrap();
+        let arr = tensor_to_array(&tensor);
+        weights.insert(name.to_string(), arr);
     }
-    let f32_slice: &[f32] = unsafe {
-        std::slice::from_raw_parts(data[offset..].as_ptr() as *const f32, (data.len() - offset) / 4)
-    };
-    Array::from_slice(f32_slice, &shape)
+    weights
 }
 
-pub fn save_f32_bin(arr: &Array, path: &str) {
-    let shape = arr.shape();
-    let mut buf = Vec::new();
-    buf.extend_from_slice(&(shape.len() as i32).to_le_bytes());
-    for &dim in shape {
-        buf.extend_from_slice(&dim.to_le_bytes());
-    }
-    let slice = arr.as_slice::<f32>();
-    for &v in slice {
-        buf.extend_from_slice(&v.to_le_bytes());
-    }
-    std::fs::write(path, buf).unwrap();
+fn get_weight(weights: &HashMap<String, Array>, key: &str) -> Array {
+    weights.get(key).unwrap_or_else(|| panic!("missing weight: {}", key)).clone()
+}
+
+fn apply_weight_norm(weight_v: &Array, weight_g: &Array) -> Array {
+    let norm = mlx_rs::linalg::norm_l2(weight_v, &[-1], true).unwrap();
+    let normed = weight_v / (norm + array!(1e-8f32));
+    weight_g * normed
 }
 
 pub struct ConformerConvModule {
@@ -113,16 +104,6 @@ pub struct CFNaiveMelPE {
 
     pub cent_table: Array,
     pub gaussian_blurred_cent_mask: Array,
-}
-
-fn apply_weight_norm(weight_v: &Array, weight_g: &Array) -> Array {
-    let norm = mlx_rs::linalg::norm_l2(weight_v, &[-1], true).unwrap();
-    let normed = weight_v / (norm + array!(1e-8f32));
-    weight_g * normed
-}
-
-fn get_weight(weights: &HashMap<String, Array>, key: &str) -> Array {
-    weights.get(key).unwrap_or_else(|| panic!("missing weight: {}", key)).clone()
 }
 
 impl CFNaiveMelPE {
@@ -295,16 +276,209 @@ impl CFNaiveMelPE {
     }
 }
 
-pub fn load_weights_safetensors(path: &str) -> HashMap<String, Array> {
-    let data = std::fs::read(path).unwrap();
-    let tensors = SafeTensors::deserialize(&data).unwrap();
-    let mut weights = HashMap::new();
-    for name in tensors.names() {
-        let tensor = tensors.tensor(name).unwrap();
-        let arr = tensor_to_array(&tensor);
-        weights.insert(name.to_string(), arr);
+fn hz_to_mel(freq: f32) -> f32 {
+    let f_min = 0.0f32;
+    let f_sp = 200.0f32 / 3.0f32;
+    let min_log_hz = 1000.0f32;
+    let min_log_mel = (min_log_hz - f_min) / f_sp;
+    let logstep = (6.4f32).ln() / 27.0f32;
+
+    if freq >= min_log_hz {
+        min_log_mel + (freq / min_log_hz).ln() / logstep
+    } else {
+        (freq - f_min) / f_sp
     }
-    weights
+}
+
+fn mel_to_hz(mel: f32) -> f32 {
+    let f_min = 0.0f32;
+    let f_sp = 200.0f32 / 3.0f32;
+    let min_log_hz = 1000.0f32;
+    let min_log_mel = (min_log_hz - f_min) / f_sp;
+    let logstep = (6.4f32).ln() / 27.0f32;
+
+    if mel >= min_log_mel {
+        min_log_hz * (logstep * (mel - min_log_mel)).exp()
+    } else {
+        f_min + f_sp * mel
+    }
+}
+
+fn fft_frequencies(sr: f32, n_fft: i32) -> Vec<f32> {
+    let n = (n_fft / 2 + 1) as usize;
+    (0..n).map(|i| i as f32 * sr / n_fft as f32).collect()
+}
+
+fn mel_frequencies(n_mels: i32, fmin: f32, fmax: f32) -> Vec<f32> {
+    let min_mel = hz_to_mel(fmin);
+    let max_mel = hz_to_mel(fmax);
+    let step = (max_mel - min_mel) / (n_mels - 1) as f32;
+    (0..n_mels).map(|i| mel_to_hz(min_mel + step * i as f32)).collect()
+}
+
+pub fn build_mel_filterbank(sr: f32, n_fft: i32, n_mels: i32, fmin: f32, fmax: f32) -> Array {
+    let n_freqs = (n_fft / 2 + 1) as usize;
+    let fftfreqs = fft_frequencies(sr, n_fft);
+    let mel_f = mel_frequencies(n_mels + 2, fmin, fmax);
+
+    let mut weights = vec![0.0f32; (n_mels as usize) * n_freqs];
+
+    for i in 0..n_mels as usize {
+        let fdiff_lower = mel_f[i + 1] - mel_f[i];
+        let fdiff_upper = mel_f[i + 2] - mel_f[i + 1];
+
+        for j in 0..n_freqs {
+            let lower = - (mel_f[i] - fftfreqs[j]) / fdiff_lower;
+            let upper = (mel_f[i + 2] - fftfreqs[j]) / fdiff_upper;
+            let w = lower.min(upper).max(0.0);
+            weights[i * n_freqs + j] = w;
+        }
+
+        // Slaney normalization
+        let enorm = 2.0f32 / (mel_f[i + 2] - mel_f[i]);
+        for j in 0..n_freqs {
+            weights[i * n_freqs + j] *= enorm;
+        }
+    }
+
+    Array::from_slice(&weights, &[n_mels, n_freqs as i32])
+}
+
+pub fn build_hann_window(size: i32) -> Array {
+    // Match PyTorch torch.hann_window(size, periodic=True)
+    let data: Vec<f32> = (0..size)
+        .map(|i| 0.5f32 * (1.0f32 - (2.0f32 * std::f32::consts::PI * i as f32 / size as f32).cos()))
+        .collect();
+    Array::from_slice(&data, &[size])
+}
+
+pub fn resample_audio(input: &[f32], input_sr: usize, output_sr: usize) -> Vec<f32> {
+    if input_sr == output_sr {
+        return input.to_vec();
+    }
+
+    // 精确复现 torchaudio.transforms.Resample (sinc_interp_hann, lowpass_filter_width=128)
+    let rolloff = 0.99f64;
+    let lowpass_filter_width = 128i32;
+
+    let gcd = {
+        let mut a = input_sr;
+        let mut b = output_sr;
+        while b != 0 {
+            let tmp = a % b;
+            a = b;
+            b = tmp;
+        }
+        a
+    };
+
+    let orig_freq = (input_sr / gcd) as f64;
+    let new_freq = (output_sr / gcd) as f64;
+    let base_freq = orig_freq.min(new_freq) * rolloff;
+    let width = ((lowpass_filter_width as f64 * orig_freq / base_freq).ceil()) as i32;
+
+    let kernel_len = (2 * width + orig_freq as i32) as usize;
+    let new_freq_i = new_freq as usize;
+    let mut kernel = vec![vec![0.0f64; kernel_len]; new_freq_i];
+
+    for j in 0..new_freq_i {
+        let t_offset = -(j as f64) / new_freq;
+        for k in 0..kernel_len {
+            let idx_val = (-width + k as i32) as f64 / orig_freq;
+            let mut t = (t_offset + idx_val) * base_freq;
+            t = t.clamp(-lowpass_filter_width as f64, lowpass_filter_width as f64);
+
+            let window = (t * std::f64::consts::PI / lowpass_filter_width as f64 / 2.0).cos().powi(2);
+            let t_pi = t * std::f64::consts::PI;
+            let sinc = if t_pi.abs() < 1e-10 { 1.0 } else { t_pi.sin() / t_pi };
+            let scale = base_freq / orig_freq;
+            kernel[j][k] = sinc * window * scale;
+        }
+    }
+
+    let input_len = input.len();
+    let pad_left = width as usize;
+    let pad_right = (width + orig_freq as i32) as usize;
+    let padded_len = input_len + pad_left + pad_right;
+    let output_len = (padded_len - kernel_len) / orig_freq as usize + 1;
+    let target_len = ((new_freq * input_len as f64) / orig_freq).ceil() as usize;
+
+    // 准备 zero-padded 输入
+    let mut padded = vec![0.0f32; padded_len];
+    padded[pad_left..pad_left + input_len].copy_from_slice(input);
+
+    // 将核转为 f32
+    let kernel_f32: Vec<Vec<f32>> = kernel.iter().map(|kj| kj.iter().map(|&v| v as f32).collect()).collect();
+
+    #[cfg(target_os = "macos")]
+    {
+        #[link(name = "Accelerate", kind = "framework")]
+        unsafe extern "C" {
+            fn vDSP_desamp(
+                source: *const f32,
+                decimation_factor: isize,
+                filter: *const f32,
+                result: *mut f32,
+                n: usize,
+                p: usize,
+            );
+        }
+
+        let mut output = vec![0.0f32; target_len];
+        let mut temp = vec![vec![0.0f32; output_len]; new_freq_i];
+
+        for j in 0..new_freq_i {
+            unsafe {
+                vDSP_desamp(
+                    padded.as_ptr(),
+                    orig_freq as isize,
+                    kernel_f32[j].as_ptr(),
+                    temp[j].as_mut_ptr(),
+                    output_len,
+                    kernel_len,
+                );
+            }
+        }
+
+        for i in 0..output_len {
+            for j in 0..new_freq_i {
+                let idx = i * new_freq_i + j;
+                if idx < target_len {
+                    output[idx] = temp[j][i];
+                }
+            }
+        }
+
+        output
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut output = vec![0.0f32; target_len];
+
+        for i in 0..output_len {
+            let start = i * orig_freq as usize;
+            for j in 0..new_freq_i {
+                let out_idx = i * new_freq_i + j;
+                if out_idx >= target_len {
+                    break;
+                }
+                let mut sum = 0.0f64;
+                for k in 0..kernel_len {
+                    let src_idx = start + k;
+                    let sample = if src_idx < pad_left || src_idx >= pad_left + input_len {
+                        0.0f64
+                    } else {
+                        input[src_idx - pad_left] as f64
+                    };
+                    sum += sample * kernel[j][k];
+                }
+                output[out_idx] = sum as f32;
+            }
+        }
+
+        output
+    }
 }
 
 fn reflect_pad_1d_last_dim(x: &Array, pad_left: i32, pad_right: i32) -> Array {

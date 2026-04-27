@@ -2,3 +2,5 @@
 *.npy
 *.npz
 *.bin
+*.safetensors
+/checkpoint
