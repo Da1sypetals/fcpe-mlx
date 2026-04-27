@@ -352,12 +352,23 @@ pub fn build_hann_window(size: i32) -> Array {
     Array::from_slice(&data, &[size])
 }
 
-pub fn resample_audio(input: &[f32], input_sr: usize, output_sr: usize) -> Vec<f32> {
+fn compute_resample_kernel(
+    input: &[f32],
+    input_sr: usize,
+    output_sr: usize,
+) -> Option<(
+    Vec<f32>,
+    Vec<Vec<f32>>,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+)> {
     if input_sr == output_sr {
-        return input.to_vec();
+        return None;
     }
 
-    // 精确复现 torchaudio.transforms.Resample (sinc_interp_hann, lowpass_filter_width=128)
     let rolloff = 0.99f64;
     let lowpass_filter_width = 128i32;
 
@@ -403,12 +414,21 @@ pub fn resample_audio(input: &[f32], input_sr: usize, output_sr: usize) -> Vec<f
     let output_len = (padded_len - kernel_len) / orig_freq as usize + 1;
     let target_len = ((new_freq * input_len as f64) / orig_freq).ceil() as usize;
 
-    // 准备 zero-padded 输入
     let mut padded = vec![0.0f32; padded_len];
     padded[pad_left..pad_left + input_len].copy_from_slice(input);
 
-    // 将核转为 f32
     let kernel_f32: Vec<Vec<f32>> = kernel.iter().map(|kj| kj.iter().map(|&v| v as f32).collect()).collect();
+
+    Some((padded, kernel_f32, orig_freq as usize, new_freq_i, kernel_len, target_len, output_len))
+}
+
+pub fn resample_audio(input: &[f32], input_sr: usize, output_sr: usize) -> Vec<f32> {
+    if input_sr == output_sr {
+        return input.to_vec();
+    }
+
+    let (padded, kernel_f32, orig_freq, new_freq_i, kernel_len, target_len, output_len) =
+        compute_resample_kernel(input, input_sr, output_sr).unwrap();
 
     #[cfg(target_os = "macos")]
     {
@@ -457,7 +477,7 @@ pub fn resample_audio(input: &[f32], input_sr: usize, output_sr: usize) -> Vec<f
         let mut output = vec![0.0f32; target_len];
 
         for i in 0..output_len {
-            let start = i * orig_freq as usize;
+            let start = i * orig_freq;
             for j in 0..new_freq_i {
                 let out_idx = i * new_freq_i + j;
                 if out_idx >= target_len {
@@ -465,13 +485,7 @@ pub fn resample_audio(input: &[f32], input_sr: usize, output_sr: usize) -> Vec<f
                 }
                 let mut sum = 0.0f64;
                 for k in 0..kernel_len {
-                    let src_idx = start + k;
-                    let sample = if src_idx < pad_left || src_idx >= pad_left + input_len {
-                        0.0f64
-                    } else {
-                        input[src_idx - pad_left] as f64
-                    };
-                    sum += sample * kernel[j][k];
+                    sum += padded[start + k] as f64 * kernel_f32[j][k] as f64;
                 }
                 output[out_idx] = sum as f32;
             }
@@ -479,6 +493,82 @@ pub fn resample_audio(input: &[f32], input_sr: usize, output_sr: usize) -> Vec<f
 
         output
     }
+}
+
+#[cfg(target_os = "macos")]
+pub fn resample_audio_metal(input: &[f32], input_sr: usize, output_sr: usize) -> Vec<f32> {
+    use metal::{Device, MTLSize};
+
+    if input_sr == output_sr {
+        return input.to_vec();
+    }
+
+    let (padded, kernel_f32, orig_freq, new_freq_i, kernel_len, target_len, _output_len) =
+        compute_resample_kernel(input, input_sr, output_sr).unwrap();
+
+    let device = Device::system_default().expect("no Metal device");
+    let queue = device.new_command_queue();
+
+    let shader_src = include_str!("resample.metal");
+
+    let library = device
+        .new_library_with_source(shader_src, &metal::CompileOptions::new())
+        .expect("failed to compile metal shader");
+    let kernel = library
+        .get_function("resample_sinc_hann", None)
+        .expect("failed to get kernel function");
+    let pipeline = device
+        .new_compute_pipeline_state_with_function(&kernel)
+        .expect("failed to create pipeline state");
+
+    let input_buffer = device.new_buffer_with_data(
+        padded.as_ptr() as *const _,
+        (padded.len() * std::mem::size_of::<f32>()) as u64,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+
+    let output_buffer = device.new_buffer(
+        (target_len * std::mem::size_of::<f32>()) as u64,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+
+    let kernel_flat: Vec<f32> = kernel_f32
+        .iter()
+        .flat_map(|row| row.iter().copied())
+        .collect();
+    let kernel_buffer = device.new_buffer_with_data(
+        kernel_flat.as_ptr() as *const _,
+        (kernel_flat.len() * std::mem::size_of::<f32>()) as u64,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+
+    let cmd_buffer = queue.new_command_buffer();
+    let encoder = cmd_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(&input_buffer), 0);
+    encoder.set_buffer(1, Some(&output_buffer), 0);
+    encoder.set_buffer(2, Some(&kernel_buffer), 0);
+
+    let kl = kernel_len as i32;
+    let of = orig_freq as i32;
+    let nf = new_freq_i as i32;
+    let tl = target_len as i32;
+
+    encoder.set_bytes(3, std::mem::size_of::<i32>() as u64, &kl as *const _ as *const _);
+    encoder.set_bytes(4, std::mem::size_of::<i32>() as u64, &of as *const _ as *const _);
+    encoder.set_bytes(5, std::mem::size_of::<i32>() as u64, &nf as *const _ as *const _);
+    encoder.set_bytes(6, std::mem::size_of::<i32>() as u64, &tl as *const _ as *const _);
+
+    let grid_size = MTLSize::new(target_len as u64, 1, 1);
+    let threadgroup_size = MTLSize::new(256, 1, 1);
+    encoder.dispatch_threads(grid_size, threadgroup_size);
+    encoder.end_encoding();
+    cmd_buffer.commit();
+    cmd_buffer.wait_until_completed();
+
+    let output_ptr = output_buffer.contents() as *const f32;
+    let output_slice = unsafe { std::slice::from_raw_parts(output_ptr, target_len) };
+    output_slice.to_vec()
 }
 
 fn reflect_pad_1d_last_dim(x: &Array, pad_left: i32, pad_right: i32) -> Array {

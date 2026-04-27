@@ -1,6 +1,6 @@
 use fcpe_mlxrs::{
     build_hann_window, build_mel_filterbank, load_weights_safetensors, postprocess_f0, resample_audio,
-    wav_to_mel_profiled, CFNaiveMelPE,
+    resample_audio_metal, wav_to_mel_profiled, CFNaiveMelPE,
 };
 use mlx_rs::Array;
 
@@ -37,6 +37,50 @@ fn main() {
     };
     println!("audio after resample shape: {:?}", audio_res.shape());
 
+    // Resample accuracy & performance comparison
+    if sr != 16000 {
+        let vdsp_res = resample_audio(slice, sr as usize, 16000);
+        let metal_res = resample_audio_metal(slice, sr as usize, 16000);
+
+        assert_eq!(vdsp_res.len(), metal_res.len(), "length mismatch");
+        let mut max_diff = 0.0f32;
+        let mut sum_sq = 0.0f64;
+        for i in 0..vdsp_res.len() {
+            let diff = (vdsp_res[i] - metal_res[i]).abs();
+            if diff > max_diff {
+                max_diff = diff;
+            }
+            sum_sq += (diff as f64).powi(2);
+        }
+        let rmse = (sum_sq / vdsp_res.len() as f64).sqrt();
+        println!("Resample vDSP vs Metal max_diff: {:.8e}, rmse: {:.8e}", max_diff, rmse);
+
+        let n = 50;
+        let mut vdsp_times = Vec::with_capacity(n);
+        let mut metal_times = Vec::with_capacity(n);
+        for _ in 0..n {
+            let t0 = std::time::Instant::now();
+            let _ = resample_audio(slice, sr as usize, 16000);
+            let t1 = std::time::Instant::now();
+            vdsp_times.push(t1.duration_since(t0).as_secs_f64() * 1000.0);
+
+            let t0 = std::time::Instant::now();
+            let _ = resample_audio_metal(slice, sr as usize, 16000);
+            let t1 = std::time::Instant::now();
+            metal_times.push(t1.duration_since(t0).as_secs_f64() * 1000.0);
+        }
+        println!(
+            "Resample vDSP ({} avg): {:.3} ms",
+            n,
+            vdsp_times.iter().sum::<f64>() / n as f64
+        );
+        println!(
+            "Resample Metal ({} avg): {:.3} ms",
+            n,
+            metal_times.iter().sum::<f64>() / n as f64
+        );
+    }
+
     let mel_basis = build_mel_filterbank(16000.0, 1024, 128, 0.0, 8000.0);
     let hann_window = build_hann_window(1024);
     let mel = wav_to_mel_profiled(&audio_res, &mel_basis, &hann_window);
@@ -63,8 +107,8 @@ fn main() {
     println!("\n=== Performance Comparison ===");
     println!("GPU postprocess (100 avg): {:.3} ms", gpu_times.iter().sum::<f64>() / n as f64);
 
-    // Full pipeline benchmark
-    let mut total_times = Vec::with_capacity(5);
+    // Full pipeline benchmark (vDSP resample)
+    let mut total_times_vdsp = Vec::with_capacity(5);
     for _ in 0..5 {
         let t0 = std::time::Instant::now();
         let slice = audio.as_slice::<f32>();
@@ -80,7 +124,28 @@ fn main() {
         let f0 = model.infer(&mel, "local_argmax", 0.006);
         let _ = postprocess_f0(&f0, model.f0_min, Some(model.f0_max), true);
         let t1 = std::time::Instant::now();
-        total_times.push(t1.duration_since(t0).as_secs_f64() * 1000.0);
+        total_times_vdsp.push(t1.duration_since(t0).as_secs_f64() * 1000.0);
     }
-    println!("Full pipeline (5 avg):     {:.3} ms", total_times.iter().sum::<f64>() / 5.0);
+    println!("Full pipeline vDSP (5 avg): {:.3} ms", total_times_vdsp.iter().sum::<f64>() / 5.0);
+
+    // Full pipeline benchmark (Metal resample)
+    let mut total_times_metal = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let t0 = std::time::Instant::now();
+        let slice = audio.as_slice::<f32>();
+        let audio_r = if sr != 16000 {
+            Array::from_slice(&resample_audio_metal(slice, sr as usize, 16000), &[1, 992000i32])
+        } else {
+            audio.clone()
+        };
+        let mel_basis = build_mel_filterbank(16000.0, 1024, 128, 0.0, 8000.0);
+        let hann_window = build_hann_window(1024);
+        let mel = wav_to_mel_profiled(&audio_r, &mel_basis, &hann_window);
+        let mut model = CFNaiveMelPE::new(weights.clone());
+        let f0 = model.infer(&mel, "local_argmax", 0.006);
+        let _ = postprocess_f0(&f0, model.f0_min, Some(model.f0_max), true);
+        let t1 = std::time::Instant::now();
+        total_times_metal.push(t1.duration_since(t0).as_secs_f64() * 1000.0);
+    }
+    println!("Full pipeline Metal (5 avg): {:.3} ms", total_times_metal.iter().sum::<f64>() / 5.0);
 }
