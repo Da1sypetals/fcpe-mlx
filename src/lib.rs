@@ -506,7 +506,7 @@ fn reflect_pad_1d_last_dim(x: &Array, pad_left: i32, pad_right: i32) -> Array {
     }
 }
 
-pub fn wav_to_mel(wav: &Array, mel_basis: &Array, hann_window: &Array) -> Array {
+pub fn wav_to_mel_profiled(wav: &Array, mel_basis: &Array, hann_window: &Array) -> Array {
     let batch = wav.shape()[0];
     let t = wav.shape()[1];
     let win_size = 1024;
@@ -515,6 +515,7 @@ pub fn wav_to_mel(wav: &Array, mel_basis: &Array, hann_window: &Array) -> Array 
     let n_mels = 128;
     let clip_val = 1e-5f32;
 
+    let t0 = std::time::Instant::now();
     let pad_left = (win_size - hop_length) / 2;
     let pad_right = std::cmp::max(
         (win_size - hop_length + 1) / 2,
@@ -528,6 +529,7 @@ pub fn wav_to_mel(wav: &Array, mel_basis: &Array, hann_window: &Array) -> Array 
         pad(&wav.reshape(&[batch, t, 1]).unwrap(), &[(0, 0), (pad_left, pad_right), (0, 0)], Array::from(0.0f32), Some(mlx_rs::ops::PadMode::Constant)).unwrap()
             .reshape(&[batch, t + pad_left + pad_right]).unwrap()
     };
+    let t1 = std::time::Instant::now();
 
     let t_padded = y_pad.shape()[1];
     let n_frames = (t_padded - win_size) / hop_length + 1;
@@ -538,24 +540,32 @@ pub fn wav_to_mel(wav: &Array, mel_basis: &Array, hann_window: &Array) -> Array 
         &[t_padded as i64, hop_length as i64, 1],
         0,
     ).unwrap();
+    let t2 = std::time::Instant::now();
 
     let hann_reshaped = hann_window.reshape(&[1, 1, win_size]).unwrap();
     let windowed = frames.multiply(&hann_reshaped).unwrap();
+    let t3 = std::time::Instant::now();
 
     let spec_complex = rfft(&windowed, n_fft, None).unwrap();
+    let t4 = std::time::Instant::now();
     let real = spec_complex.real().unwrap();
     let imag = spec_complex.imag().unwrap();
     let mag = sqrt(&square(&real).unwrap().add(&square(&imag).unwrap()).unwrap().add(&Array::from(1e-9f32)).unwrap()).unwrap();
+    let t5 = std::time::Instant::now();
 
     let mag_t = transpose_axes(&mag, &[0, 2, 1]).unwrap();
+    let t6 = std::time::Instant::now();
 
     let mel_basis_3d = mel_basis.reshape(&[1, n_mels, n_fft / 2 + 1]).unwrap();
     let spec_mel = mel_basis_3d.matmul(&mag_t).unwrap();
+    let t7 = std::time::Instant::now();
 
     let clamped = maximum(&spec_mel, &Array::from(clip_val)).unwrap();
     let compressed = clamped.multiply(&Array::from(1.0f32)).unwrap().log().unwrap();
+    let t8 = std::time::Instant::now();
 
     let spec_out = transpose_axes(&compressed, &[0, 2, 1]).unwrap();
+    let t9 = std::time::Instant::now();
 
     let target_n_frames = t / hop_length + 1;
     let mel_final = if target_n_frames > spec_out.shape()[1] {
@@ -566,6 +576,20 @@ pub fn wav_to_mel(wav: &Array, mel_basis: &Array, hann_window: &Array) -> Array 
     } else {
         spec_out
     };
+    let t10 = std::time::Instant::now();
+
+    eprintln!("[PROFILE mel] pad={:.3}us as_strided={:.3}us window={:.3}us rfft={:.3}us mag={:.3}us transpose1={:.3}us matmul={:.3}us clamp_log={:.3}us transpose2={:.3}us trim={:.3}us",
+        t1.duration_since(t0).as_secs_f64() * 1e6,
+        t2.duration_since(t1).as_secs_f64() * 1e6,
+        t3.duration_since(t2).as_secs_f64() * 1e6,
+        t4.duration_since(t3).as_secs_f64() * 1e6,
+        t5.duration_since(t4).as_secs_f64() * 1e6,
+        t6.duration_since(t5).as_secs_f64() * 1e6,
+        t7.duration_since(t6).as_secs_f64() * 1e6,
+        t8.duration_since(t7).as_secs_f64() * 1e6,
+        t9.duration_since(t8).as_secs_f64() * 1e6,
+        t10.duration_since(t9).as_secs_f64() * 1e6,
+    );
 
     mel_final
 }
@@ -631,6 +655,124 @@ fn batch_interp_with_replacement_detach(uv: &Array, f0: &Array) -> Array {
     Array::from_slice(&result, &[b, t])
 }
 
+fn batch_interp_with_replacement_detach_gpu(uv: &Array, f0: &Array) -> Array {
+    let shape = uv.shape();
+    let b = shape[0];
+    let t = shape[1];
+
+    // uv: (B, T) bool, true = unvoiced
+    // f0: (B, T) f32, already zeroed for uv frames
+
+    // Create position indices: (1, T)
+    let x = mlx_rs::ops::arange::<_, f32>(0.0, t as f32, None).unwrap()
+        .reshape(&[1, t]).unwrap();
+
+    // voiced_mask: (B, T), 1.0 for voiced, 0.0 for unvoiced
+    let voiced_mask = mlx_rs::ops::r#where(
+        uv,
+        &Array::from(0.0f32),
+        &Array::from(1.0f32),
+    ).unwrap();
+
+    // voiced_pos: position where voiced, -inf where unvoiced (so cummax ignores them)
+    let neg_inf = Array::from(f32::NEG_INFINITY);
+    let voiced_pos = mlx_rs::ops::r#where(
+        &voiced_mask,
+        &x,
+        &neg_inf,
+    ).unwrap();
+
+    // left_pos: forward cummax, gives position of last voiced point seen so far
+    let left_pos = voiced_pos.cummax(1, None, Some(true)).unwrap();
+
+    // right_pos: reverse cummax, gives first voiced point from the right
+    let right_pos = voiced_pos.cummax(1, Some(true), Some(true)).unwrap();
+
+    // For positions with no voiced neighbor, cummax returns -inf
+    // Find the first and last voiced positions globally
+    let first_voiced = argmax_axis(&voiced_mask, 1, false).unwrap()
+        .as_type::<f32>().unwrap();
+    let rev_voiced_mask = mlx_rs::ops::indexing::take_along_axis_device(
+        &voiced_mask,
+        &mlx_rs::ops::arange::<_, i32>((t - 1) as i32, -1i32, Some(-1i32)).unwrap().reshape(&[1, t]).unwrap(),
+        1,
+        mlx_rs::StreamOrDevice::default(),
+    ).unwrap();
+    let last_voiced_rev = argmax_axis(&rev_voiced_mask, 1, false).unwrap()
+        .as_type::<f32>().unwrap();
+    let last_voiced = Array::from((t - 1) as f32).subtract(&last_voiced_rev).unwrap();
+
+    let left_pos = mlx_rs::ops::r#where(
+        &mlx_rs::ops::eq(&left_pos, &neg_inf).unwrap(),
+        &first_voiced,
+        &left_pos,
+    ).unwrap();
+    let right_pos = mlx_rs::ops::r#where(
+        &mlx_rs::ops::eq(&right_pos, &neg_inf).unwrap(),
+        &last_voiced,
+        &right_pos,
+    ).unwrap();
+
+    // Convert to integer indices
+    let left_idx_i = left_pos.as_type::<i32>().unwrap();
+    let right_idx_i = right_pos.as_type::<i32>().unwrap();
+
+    // Clamp
+    let max_idx = Array::from(t - 1);
+    let zero = Array::from(0i32);
+    let left_idx_i = mlx_rs::ops::maximum(&left_idx_i, &zero).unwrap();
+    let left_idx_i = mlx_rs::ops::minimum(&left_idx_i, &max_idx).unwrap();
+    let right_idx_i = mlx_rs::ops::maximum(&right_idx_i, &zero).unwrap();
+    let right_idx_i = mlx_rs::ops::minimum(&right_idx_i, &max_idx).unwrap();
+
+    // Use index op for gathering: f0[b, left_idx] 
+    // mlx index: f0.index((.., left_idx_i)) should work for per-batch indexing
+    // But mlx-rs indexing may not support Array indices directly
+    // Alternative: use take_along_axis with proper shapes
+
+    // f0 is (B, T), we need to gather along axis=1
+    // take_along_axis expects indices of shape (B, T) and input of shape (B, T)
+    // But we want to gather f0 at left_idx for each position
+    // Actually, we can use advanced indexing via mlx::ops::take
+
+    // Use take_along_axis for gathering: input (B, T), indices (B, T), axis=1
+    // But take_along_axis expects indices to have the same shape as input
+    // and gathers along the specified axis
+    // We need to expand indices to (B, T, 1) and input to (B, T, 1) for axis=2? No.
+    
+    // Actually, for take_along_axis with axis=1:
+    // input: (B, T), indices: (B, T), output: (B, T)
+    // Each element in output is input[b, indices[b, t]]
+    // This is exactly what we need!
+    
+    let f0_left = mlx_rs::ops::indexing::take_along_axis_device(&f0, &left_idx_i, 1, mlx_rs::StreamOrDevice::default()).unwrap();
+    let f0_right = mlx_rs::ops::indexing::take_along_axis_device(&f0, &right_idx_i, 1, mlx_rs::StreamOrDevice::default()).unwrap();
+
+    // Position values as float
+    let left_pos_f = left_pos;
+    let right_pos_f = right_pos;
+
+    // x positions broadcasted to (B, T)
+    let x_b = mlx_rs::ops::broadcast_to_device(&x, &[b, t], mlx_rs::StreamOrDevice::default()).unwrap();
+
+    // Linear interpolation
+    let dx = right_pos_f.subtract(&left_pos_f).unwrap();
+    let dx_safe = mlx_rs::ops::maximum(&dx, &Array::from(1e-8f32)).unwrap();
+
+    let ratio = x_b.subtract(&left_pos_f).unwrap()
+        .divide(&dx_safe).unwrap();
+    let ratio = mlx_rs::ops::minimum(&ratio, &Array::from(1.0f32)).unwrap();
+    let ratio = mlx_rs::ops::maximum(&ratio, &Array::from(0.0f32)).unwrap();
+
+    let interp = f0_left.add(
+        &f0_right.subtract(&f0_left).unwrap()
+            .multiply(&ratio).unwrap()
+    ).unwrap();
+
+    // Where voiced (not uv), use original f0; where unvoiced, use interp
+    mlx_rs::ops::r#where(uv, &interp, f0).unwrap()
+}
+
 pub fn postprocess_f0(
     f0: &Array,
     f0_min: f32,
@@ -647,10 +789,57 @@ pub fn postprocess_f0(
     f0 = f0.multiply(&(&one - &uv_float)).unwrap();
 
     if interp_uv {
+        let uv_bool = uv.reshape(&[uv.shape()[0], uv.shape()[1]]).unwrap();
+        let f0_squeezed = f0.reshape(&[f0.shape()[0], f0.shape()[1]]).unwrap();
+        f0 = batch_interp_with_replacement_detach_gpu(&uv_bool, &f0_squeezed)
+            .reshape(&[f0.shape()[0], f0.shape()[1], 1]).unwrap();
+    }
+
+    if let Some(fmax) = f0_max {
+        f0 = mlx_rs::ops::r#where(
+            &mlx_rs::ops::gt(&f0, &Array::from(fmax)).unwrap(),
+            &Array::from(fmax),
+            &f0,
+        ).unwrap();
+    }
+
+    f0
+}
+
+pub fn postprocess_f0_profiled(
+    f0: &Array,
+    f0_min: f32,
+    f0_max: Option<f32>,
+    interp_uv: bool,
+) -> Array {
+    let t0 = std::time::Instant::now();
+    let mut f0 = f0.clone();
+
+    let t1 = std::time::Instant::now();
+    let uv = mlx_rs::ops::lt(&f0, &Array::from(f0_min)).unwrap();
+    let t2 = std::time::Instant::now();
+    let one = Array::from(1.0f32);
+    let zero = Array::from(0.0f32);
+    let t3 = std::time::Instant::now();
+    let uv_float = mlx_rs::ops::r#where(&uv, &one, &zero).unwrap();
+    let t4 = std::time::Instant::now();
+
+    f0 = f0.multiply(&(&one - &uv_float)).unwrap();
+    let t5 = std::time::Instant::now();
+
+    if interp_uv {
         let uv_bool = uv;
         let f0_squeezed = f0.reshape(&[f0.shape()[0], f0.shape()[1]]).unwrap();
+        let t6 = std::time::Instant::now();
         f0 = batch_interp_with_replacement_detach(&uv_bool, &f0_squeezed)
             .reshape(&[f0.shape()[0], f0.shape()[1], 1]).unwrap();
+        let t7 = std::time::Instant::now();
+        eprintln!("[PROFILE postprocess] lt={:.3}us where1={:.3}us multiply={:.3}us interp={:.3}us",
+            t2.duration_since(t1).as_secs_f64() * 1e6,
+            t4.duration_since(t3).as_secs_f64() * 1e6,
+            t5.duration_since(t4).as_secs_f64() * 1e6,
+            t7.duration_since(t6).as_secs_f64() * 1e6,
+        );
     }
 
     if let Some(fmax) = f0_max {
