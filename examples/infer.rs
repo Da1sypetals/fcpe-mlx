@@ -1,8 +1,18 @@
 use fcpe_mlxrs::{
     build_hann_window, build_mel_filterbank, load_weights_safetensors, postprocess_f0, resample_audio,
-    resample_audio_metal, wav_to_mel_profiled, CFNaiveMelPE,
+    resample_audio_metal, resample_audio_metal_v2, wav_to_mel_profiled, CFNaiveMelPE,
 };
 use mlx_rs::Array;
+
+fn iqr_mean(mut times: Vec<f64>) -> (f64, f64, f64) {
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let n = times.len();
+    let q1 = times[n / 4];
+    let q3 = times[n * 3 / 4];
+    let slice = &times[n / 4..n * 3 / 4];
+    let mean = slice.iter().sum::<f64>() / slice.len() as f64;
+    (mean, q1, q3)
+}
 
 fn load_wav(path: &str) -> (Array, u32) {
     let mut r = hound::WavReader::open(path).unwrap();
@@ -55,9 +65,10 @@ fn main() {
         let rmse = (sum_sq / vdsp_res.len() as f64).sqrt();
         println!("Resample vDSP vs Metal max_diff: {:.8e}, rmse: {:.8e}", max_diff, rmse);
 
-        let n = 50;
+        let n = 200;
         let mut vdsp_times = Vec::with_capacity(n);
         let mut metal_times = Vec::with_capacity(n);
+        let mut metal_v2_times = Vec::with_capacity(n);
         for _ in 0..n {
             let t0 = std::time::Instant::now();
             let _ = resample_audio(slice, sr as usize, 16000);
@@ -68,16 +79,28 @@ fn main() {
             let _ = resample_audio_metal(slice, sr as usize, 16000);
             let t1 = std::time::Instant::now();
             metal_times.push(t1.duration_since(t0).as_secs_f64() * 1000.0);
+
+            let t0 = std::time::Instant::now();
+            let _ = resample_audio_metal_v2(slice, sr as usize, 16000);
+            let t1 = std::time::Instant::now();
+            metal_v2_times.push(t1.duration_since(t0).as_secs_f64() * 1000.0);
         }
+
+        let (vdsp_mean, vdsp_q1, vdsp_q3) = iqr_mean(vdsp_times);
+        let (metal_mean, metal_q1, metal_q3) = iqr_mean(metal_times);
+        let (metal_v2_mean, metal_v2_q1, metal_v2_q3) = iqr_mean(metal_v2_times);
+
         println!(
-            "Resample vDSP ({} avg): {:.3} ms",
-            n,
-            vdsp_times.iter().sum::<f64>() / n as f64
+            "Resample vDSP ({} IQR mean): {:.3} ms (Q1={:.3} Q3={:.3})",
+            n, vdsp_mean, vdsp_q1, vdsp_q3
         );
         println!(
-            "Resample Metal ({} avg): {:.3} ms",
-            n,
-            metal_times.iter().sum::<f64>() / n as f64
+            "Resample Metal ({} IQR mean): {:.3} ms (Q1={:.3} Q3={:.3})",
+            n, metal_mean, metal_q1, metal_q3
+        );
+        println!(
+            "Resample Metal v2 ({} IQR mean): {:.3} ms (Q1={:.3} Q3={:.3})",
+            n, metal_v2_mean, metal_v2_q1, metal_v2_q3
         );
     }
 
@@ -105,11 +128,15 @@ fn main() {
     println!("GPU f0 max: {:?}", f0_gpu.max(None).unwrap().item::<f32>());
 
     println!("\n=== Performance Comparison ===");
-    println!("GPU postprocess (100 avg): {:.3} ms", gpu_times.iter().sum::<f64>() / n as f64);
+    let (gpu_mean, gpu_q1, gpu_q3) = iqr_mean(gpu_times);
+    println!("GPU postprocess ({} IQR mean): {:.3} ms (Q1={:.3} Q3={:.3})", n, gpu_mean, gpu_q1, gpu_q3);
 
     // Full pipeline benchmark (vDSP resample)
-    let mut total_times_vdsp = Vec::with_capacity(5);
-    for _ in 0..5 {
+    let pn = 20;
+    let mut total_times_vdsp = Vec::with_capacity(pn);
+    let mut total_times_metal = Vec::with_capacity(pn);
+    let mut total_times_metal_v2 = Vec::with_capacity(pn);
+    for _ in 0..pn {
         let t0 = std::time::Instant::now();
         let slice = audio.as_slice::<f32>();
         let audio_r = if sr != 16000 {
@@ -125,12 +152,7 @@ fn main() {
         let _ = postprocess_f0(&f0, model.f0_min, Some(model.f0_max), true);
         let t1 = std::time::Instant::now();
         total_times_vdsp.push(t1.duration_since(t0).as_secs_f64() * 1000.0);
-    }
-    println!("Full pipeline vDSP (5 avg): {:.3} ms", total_times_vdsp.iter().sum::<f64>() / 5.0);
 
-    // Full pipeline benchmark (Metal resample)
-    let mut total_times_metal = Vec::with_capacity(5);
-    for _ in 0..5 {
         let t0 = std::time::Instant::now();
         let slice = audio.as_slice::<f32>();
         let audio_r = if sr != 16000 {
@@ -146,6 +168,29 @@ fn main() {
         let _ = postprocess_f0(&f0, model.f0_min, Some(model.f0_max), true);
         let t1 = std::time::Instant::now();
         total_times_metal.push(t1.duration_since(t0).as_secs_f64() * 1000.0);
+
+        let t0 = std::time::Instant::now();
+        let slice = audio.as_slice::<f32>();
+        let audio_r = if sr != 16000 {
+            Array::from_slice(&resample_audio_metal_v2(slice, sr as usize, 16000), &[1, 992000i32])
+        } else {
+            audio.clone()
+        };
+        let mel_basis = build_mel_filterbank(16000.0, 1024, 128, 0.0, 8000.0);
+        let hann_window = build_hann_window(1024);
+        let mel = wav_to_mel_profiled(&audio_r, &mel_basis, &hann_window);
+        let mut model = CFNaiveMelPE::new(weights.clone());
+        let f0 = model.infer(&mel, "local_argmax", 0.006);
+        let _ = postprocess_f0(&f0, model.f0_min, Some(model.f0_max), true);
+        let t1 = std::time::Instant::now();
+        total_times_metal_v2.push(t1.duration_since(t0).as_secs_f64() * 1000.0);
     }
-    println!("Full pipeline Metal (5 avg): {:.3} ms", total_times_metal.iter().sum::<f64>() / 5.0);
+
+    let (vdsp_pipe_mean, vdsp_pipe_q1, vdsp_pipe_q3) = iqr_mean(total_times_vdsp);
+    let (metal_pipe_mean, metal_pipe_q1, metal_pipe_q3) = iqr_mean(total_times_metal);
+    let (metal_v2_pipe_mean, metal_v2_pipe_q1, metal_v2_pipe_q3) = iqr_mean(total_times_metal_v2);
+
+    println!("Full pipeline vDSP ({} IQR mean): {:.3} ms (Q1={:.3} Q3={:.3})", pn, vdsp_pipe_mean, vdsp_pipe_q1, vdsp_pipe_q3);
+    println!("Full pipeline Metal ({} IQR mean): {:.3} ms (Q1={:.3} Q3={:.3})", pn, metal_pipe_mean, metal_pipe_q1, metal_pipe_q3);
+    println!("Full pipeline Metal v2 ({} IQR mean): {:.3} ms (Q1={:.3} Q3={:.3})", pn, metal_v2_pipe_mean, metal_v2_pipe_q1, metal_v2_pipe_q3);
 }

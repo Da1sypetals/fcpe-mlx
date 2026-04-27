@@ -571,6 +571,94 @@ pub fn resample_audio_metal(input: &[f32], input_sr: usize, output_sr: usize) ->
     output_slice.to_vec()
 }
 
+#[cfg(target_os = "macos")]
+pub fn resample_audio_metal_v2(input: &[f32], input_sr: usize, output_sr: usize) -> Vec<f32> {
+    use metal::{Device, MTLSize};
+
+    if input_sr == output_sr {
+        return input.to_vec();
+    }
+
+    let (padded, kernel_f32, orig_freq, new_freq_i, kernel_len, target_len, _output_len) =
+        compute_resample_kernel(input, input_sr, output_sr).unwrap();
+
+    let device = Device::system_default().expect("no Metal device");
+    let queue = device.new_command_queue();
+
+    let shader_src = include_str!("resample_v2.metal");
+
+    let library = device
+        .new_library_with_source(shader_src, &metal::CompileOptions::new())
+        .expect("failed to compile metal shader v2");
+    let kernel = library
+        .get_function("resample_sinc_hann_v2", None)
+        .expect("failed to get kernel function v2");
+    let pipeline = device
+        .new_compute_pipeline_state_with_function(&kernel)
+        .expect("failed to create pipeline state v2");
+
+    let input_buffer = device.new_buffer_with_data(
+        padded.as_ptr() as *const _,
+        (padded.len() * std::mem::size_of::<f32>()) as u64,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+
+    let output_buffer = device.new_buffer(
+        (target_len * std::mem::size_of::<f32>()) as u64,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+
+    let kernel_flat: Vec<f32> = kernel_f32
+        .iter()
+        .flat_map(|row| row.iter().copied())
+        .collect();
+    let kernel_buffer = device.new_buffer_with_data(
+        kernel_flat.as_ptr() as *const _,
+        (kernel_flat.len() * std::mem::size_of::<f32>()) as u64,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+
+    // 计算 threadgroup 大小，确保 shared memory 不超过 32KB
+    let max_tg_size: usize = 256;
+    let max_shared_floats: usize = 8192; // 32KB / 4 bytes
+    let tg_size = std::cmp::min(
+        max_tg_size,
+        std::cmp::max(1, (max_shared_floats - kernel_len) / orig_freq + 1),
+    );
+    let shared_len = (tg_size - 1) * orig_freq + kernel_len;
+    let shared_mem_bytes = (shared_len * std::mem::size_of::<f32>()) as u64;
+
+    let cmd_buffer = queue.new_command_buffer();
+    let encoder = cmd_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(&input_buffer), 0);
+    encoder.set_buffer(1, Some(&output_buffer), 0);
+    encoder.set_buffer(2, Some(&kernel_buffer), 0);
+
+    let kl = kernel_len as i32;
+    let of = orig_freq as i32;
+    let nf = new_freq_i as i32;
+    let tl = target_len as i32;
+
+    encoder.set_bytes(3, std::mem::size_of::<i32>() as u64, &kl as *const _ as *const _);
+    encoder.set_bytes(4, std::mem::size_of::<i32>() as u64, &of as *const _ as *const _);
+    encoder.set_bytes(5, std::mem::size_of::<i32>() as u64, &nf as *const _ as *const _);
+    encoder.set_bytes(6, std::mem::size_of::<i32>() as u64, &tl as *const _ as *const _);
+
+    encoder.set_threadgroup_memory_length(0, shared_mem_bytes);
+
+    let grid_size = MTLSize::new(target_len as u64, 1, 1);
+    let threadgroup_size = MTLSize::new(tg_size as u64, 1, 1);
+    encoder.dispatch_threads(grid_size, threadgroup_size);
+    encoder.end_encoding();
+    cmd_buffer.commit();
+    cmd_buffer.wait_until_completed();
+
+    let output_ptr = output_buffer.contents() as *const f32;
+    let output_slice = unsafe { std::slice::from_raw_parts(output_ptr, target_len) };
+    output_slice.to_vec()
+}
+
 fn reflect_pad_1d_last_dim(x: &Array, pad_left: i32, pad_right: i32) -> Array {
     let shape = x.shape();
     let t = shape[shape.len() - 1];
