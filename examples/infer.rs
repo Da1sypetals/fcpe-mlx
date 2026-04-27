@@ -1,6 +1,6 @@
 use fcpe_mlxrs::{
     build_hann_window, build_mel_filterbank, load_weights_safetensors, postprocess_f0, resample_audio,
-    resample_audio_metal, resample_audio_metal_v2, wav_to_mel_profiled, CFNaiveMelPE,
+    resample_audio_metal, wav_to_mel_profiled, CFNaiveMelPE,
 };
 use mlx_rs::Array;
 
@@ -47,63 +47,6 @@ fn main() {
     };
     println!("audio after resample shape: {:?}", audio_res.shape());
 
-    // Resample accuracy & performance comparison
-    if sr != 16000 {
-        let vdsp_res = resample_audio(slice, sr as usize, 16000);
-        let metal_res = resample_audio_metal(slice, sr as usize, 16000);
-
-        assert_eq!(vdsp_res.len(), metal_res.len(), "length mismatch");
-        let mut max_diff = 0.0f32;
-        let mut sum_sq = 0.0f64;
-        for i in 0..vdsp_res.len() {
-            let diff = (vdsp_res[i] - metal_res[i]).abs();
-            if diff > max_diff {
-                max_diff = diff;
-            }
-            sum_sq += (diff as f64).powi(2);
-        }
-        let rmse = (sum_sq / vdsp_res.len() as f64).sqrt();
-        println!("Resample vDSP vs Metal max_diff: {:.8e}, rmse: {:.8e}", max_diff, rmse);
-
-        let n = 200;
-        let mut vdsp_times = Vec::with_capacity(n);
-        let mut metal_times = Vec::with_capacity(n);
-        let mut metal_v2_times = Vec::with_capacity(n);
-        for _ in 0..n {
-            let t0 = std::time::Instant::now();
-            let _ = resample_audio(slice, sr as usize, 16000);
-            let t1 = std::time::Instant::now();
-            vdsp_times.push(t1.duration_since(t0).as_secs_f64() * 1000.0);
-
-            let t0 = std::time::Instant::now();
-            let _ = resample_audio_metal(slice, sr as usize, 16000);
-            let t1 = std::time::Instant::now();
-            metal_times.push(t1.duration_since(t0).as_secs_f64() * 1000.0);
-
-            let t0 = std::time::Instant::now();
-            let _ = resample_audio_metal_v2(slice, sr as usize, 16000);
-            let t1 = std::time::Instant::now();
-            metal_v2_times.push(t1.duration_since(t0).as_secs_f64() * 1000.0);
-        }
-
-        let (vdsp_mean, vdsp_q1, vdsp_q3) = iqr_mean(vdsp_times);
-        let (metal_mean, metal_q1, metal_q3) = iqr_mean(metal_times);
-        let (metal_v2_mean, metal_v2_q1, metal_v2_q3) = iqr_mean(metal_v2_times);
-
-        println!(
-            "Resample vDSP ({} IQR mean): {:.3} ms (Q1={:.3} Q3={:.3})",
-            n, vdsp_mean, vdsp_q1, vdsp_q3
-        );
-        println!(
-            "Resample Metal ({} IQR mean): {:.3} ms (Q1={:.3} Q3={:.3})",
-            n, metal_mean, metal_q1, metal_q3
-        );
-        println!(
-            "Resample Metal v2 ({} IQR mean): {:.3} ms (Q1={:.3} Q3={:.3})",
-            n, metal_v2_mean, metal_v2_q1, metal_v2_q3
-        );
-    }
-
     let mel_basis = build_mel_filterbank(16000.0, 1024, 128, 0.0, 8000.0);
     let hann_window = build_hann_window(1024);
     let mel = wav_to_mel_profiled(&audio_res, &mel_basis, &hann_window);
@@ -113,29 +56,14 @@ fn main() {
     let f0 = model.infer(&mel, "local_argmax", 0.006);
     println!("raw f0 shape: {:?}", f0.shape());
 
-    // E2E benchmark: GPU postprocess
-    let n = 100;
-    let mut gpu_times = Vec::with_capacity(n);
-    for _ in 0..n {
-        let t0 = std::time::Instant::now();
-        let _ = postprocess_f0(&f0, model.f0_min, Some(model.f0_max), true);
-        let t1 = std::time::Instant::now();
-        gpu_times.push(t1.duration_since(t0).as_secs_f64() * 1000.0);
-    }
-
     let f0_gpu = postprocess_f0(&f0, model.f0_min, Some(model.f0_max), true);
     println!("GPU f0 min: {:?}", f0_gpu.min(None).unwrap().item::<f32>());
     println!("GPU f0 max: {:?}", f0_gpu.max(None).unwrap().item::<f32>());
 
-    println!("\n=== Performance Comparison ===");
-    let (gpu_mean, gpu_q1, gpu_q3) = iqr_mean(gpu_times);
-    println!("GPU postprocess ({} IQR mean): {:.3} ms (Q1={:.3} Q3={:.3})", n, gpu_mean, gpu_q1, gpu_q3);
-
-    // Full pipeline benchmark (vDSP resample)
+    // Full pipeline benchmark (vDSP vs Metal)
     let pn = 20;
     let mut total_times_vdsp = Vec::with_capacity(pn);
     let mut total_times_metal = Vec::with_capacity(pn);
-    let mut total_times_metal_v2 = Vec::with_capacity(pn);
     for _ in 0..pn {
         let t0 = std::time::Instant::now();
         let slice = audio.as_slice::<f32>();
@@ -168,29 +96,12 @@ fn main() {
         let _ = postprocess_f0(&f0, model.f0_min, Some(model.f0_max), true);
         let t1 = std::time::Instant::now();
         total_times_metal.push(t1.duration_since(t0).as_secs_f64() * 1000.0);
-
-        let t0 = std::time::Instant::now();
-        let slice = audio.as_slice::<f32>();
-        let audio_r = if sr != 16000 {
-            Array::from_slice(&resample_audio_metal_v2(slice, sr as usize, 16000), &[1, 992000i32])
-        } else {
-            audio.clone()
-        };
-        let mel_basis = build_mel_filterbank(16000.0, 1024, 128, 0.0, 8000.0);
-        let hann_window = build_hann_window(1024);
-        let mel = wav_to_mel_profiled(&audio_r, &mel_basis, &hann_window);
-        let mut model = CFNaiveMelPE::new(weights.clone());
-        let f0 = model.infer(&mel, "local_argmax", 0.006);
-        let _ = postprocess_f0(&f0, model.f0_min, Some(model.f0_max), true);
-        let t1 = std::time::Instant::now();
-        total_times_metal_v2.push(t1.duration_since(t0).as_secs_f64() * 1000.0);
     }
 
     let (vdsp_pipe_mean, vdsp_pipe_q1, vdsp_pipe_q3) = iqr_mean(total_times_vdsp);
     let (metal_pipe_mean, metal_pipe_q1, metal_pipe_q3) = iqr_mean(total_times_metal);
-    let (metal_v2_pipe_mean, metal_v2_pipe_q1, metal_v2_pipe_q3) = iqr_mean(total_times_metal_v2);
 
+    println!("\n=== Full Pipeline E2E Performance ===");
     println!("Full pipeline vDSP ({} IQR mean): {:.3} ms (Q1={:.3} Q3={:.3})", pn, vdsp_pipe_mean, vdsp_pipe_q1, vdsp_pipe_q3);
     println!("Full pipeline Metal ({} IQR mean): {:.3} ms (Q1={:.3} Q3={:.3})", pn, metal_pipe_mean, metal_pipe_q1, metal_pipe_q3);
-    println!("Full pipeline Metal v2 ({} IQR mean): {:.3} ms (Q1={:.3} Q3={:.3})", pn, metal_v2_pipe_mean, metal_v2_pipe_q1, metal_v2_pipe_q3);
 }
