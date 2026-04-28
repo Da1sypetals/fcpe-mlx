@@ -3,6 +3,8 @@ use fcpe_mlxrs::{
     resample_audio_metal, wav_to_mel, CFNaiveMelPE,
 };
 use mlx_rs::Array;
+use std::env;
+use std::io::Write;
 
 fn iqr_mean(mut times: Vec<f64>) -> (f64, f64, f64) {
     times.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -33,10 +35,14 @@ fn load_wav(path: &str) -> (Array, u32) {
 }
 
 fn main() {
+    let args: Vec<String> = env::args().collect();
+    let wav_path = args.get(1).map(|s| s.as_str()).unwrap_or("/Users/daisy/develop/fcpe-mlxrs/audio/huaxue.wav");
+    let out_path = args.get(2).map(|s| s.as_str()).unwrap_or("/tmp/rust_f0.txt");
+
     let weights = load_weights_safetensors("/Users/daisy/develop/fcpe-mlxrs/fcpe.safetensors");
     println!("Loaded {} weights from safetensors", weights.len());
 
-    let (audio, sr) = load_wav("/Users/daisy/develop/fcpe-mlxrs/audio/huaxue.wav");
+    let (audio, sr) = load_wav(wav_path);
     println!("audio shape: {:?}, sr: {}", audio.shape(), sr);
 
     let slice = audio.as_slice::<f32>();
@@ -56,9 +62,21 @@ fn main() {
     let f0 = model.infer(&mel, "local_argmax", 0.006);
     println!("raw f0 shape: {:?}", f0.shape());
 
-    let f0_gpu = postprocess_f0(&f0, model.f0_min, Some(model.f0_max), true);
+    let (f0_gpu, uv_gpu) = postprocess_f0(&f0, model.f0_min, Some(model.f0_max), true);
     println!("GPU f0 min: {:?}", f0_gpu.min(None).unwrap().item::<f32>());
     println!("GPU f0 max: {:?}", f0_gpu.max(None).unwrap().item::<f32>());
+
+    let f0_slice = f0_gpu.as_slice::<f32>();
+    let uv_slice = uv_gpu.as_slice::<f32>();
+    let mut file = std::fs::File::create(out_path).unwrap();
+    for i in 0..f0_slice.len() {
+        if uv_slice[i] > 0.5 {
+            writeln!(file, "0.0").unwrap();
+        } else {
+            writeln!(file, "{}", f0_slice[i]).unwrap();
+        }
+    }
+    println!("Saved f0 to {}", out_path);
 
     // Full pipeline benchmark (vDSP vs Metal)
     let pn = 20;

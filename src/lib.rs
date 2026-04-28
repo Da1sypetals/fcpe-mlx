@@ -753,30 +753,19 @@ fn batch_interp_with_replacement_detach_gpu(uv: &Array, f0: &Array) -> Array {
     let b = shape[0];
     let t = shape[1];
 
-    // uv: (B, T) bool, true = unvoiced
-    // f0: (B, T) f32, already zeroed for uv frames
-
-    // Create position indices: (1, T)
     let x = mlx_rs::ops::arange::<_, f32>(0.0, t as f32, None)
         .unwrap()
         .reshape(&[1, t])
         .unwrap();
 
-    // voiced_mask: (B, T), 1.0 for voiced, 0.0 for unvoiced
     let voiced_mask = mlx_rs::ops::r#where(uv, &Array::from(0.0f32), &Array::from(1.0f32)).unwrap();
 
-    // voiced_pos: position where voiced, -inf where unvoiced (so cummax ignores them)
     let neg_inf = Array::from(f32::NEG_INFINITY);
     let voiced_pos = mlx_rs::ops::r#where(&voiced_mask, &x, &neg_inf).unwrap();
 
-    // left_pos: forward cummax, gives position of last voiced point seen so far
     let left_pos = voiced_pos.cummax(1, None, Some(true)).unwrap();
-
-    // right_pos: reverse cummax, gives first voiced point from the right
     let right_pos = voiced_pos.cummax(1, Some(true), Some(true)).unwrap();
 
-    // For positions with no voiced neighbor, cummax returns -inf
-    // Find the first and last voiced positions globally
     let first_voiced = argmax_axis(&voiced_mask, 1, false)
         .unwrap()
         .as_type::<f32>()
@@ -812,37 +801,15 @@ fn batch_interp_with_replacement_detach_gpu(uv: &Array, f0: &Array) -> Array {
     )
     .unwrap();
 
-    // Convert to integer indices
     let left_idx_i = left_pos.as_type::<i32>().unwrap();
     let right_idx_i = right_pos.as_type::<i32>().unwrap();
 
-    // Clamp
     let max_idx = Array::from(t - 1);
     let zero = Array::from(0i32);
     let left_idx_i = mlx_rs::ops::maximum(&left_idx_i, &zero).unwrap();
     let left_idx_i = mlx_rs::ops::minimum(&left_idx_i, &max_idx).unwrap();
     let right_idx_i = mlx_rs::ops::maximum(&right_idx_i, &zero).unwrap();
     let right_idx_i = mlx_rs::ops::minimum(&right_idx_i, &max_idx).unwrap();
-
-    // Use index op for gathering: f0[b, left_idx]
-    // mlx index: f0.index((.., left_idx_i)) should work for per-batch indexing
-    // But mlx-rs indexing may not support Array indices directly
-    // Alternative: use take_along_axis with proper shapes
-
-    // f0 is (B, T), we need to gather along axis=1
-    // take_along_axis expects indices of shape (B, T) and input of shape (B, T)
-    // But we want to gather f0 at left_idx for each position
-    // Actually, we can use advanced indexing via mlx::ops::take
-
-    // Use take_along_axis for gathering: input (B, T), indices (B, T), axis=1
-    // But take_along_axis expects indices to have the same shape as input
-    // and gathers along the specified axis
-    // We need to expand indices to (B, T, 1) and input to (B, T, 1) for axis=2? No.
-
-    // Actually, for take_along_axis with axis=1:
-    // input: (B, T), indices: (B, T), output: (B, T)
-    // Each element in output is input[b, indices[b, t]]
-    // This is exactly what we need!
 
     let f0_left = mlx_rs::ops::indexing::take_along_axis_device(
         &f0,
@@ -859,15 +826,12 @@ fn batch_interp_with_replacement_detach_gpu(uv: &Array, f0: &Array) -> Array {
     )
     .unwrap();
 
-    // Position values as float
     let left_pos_f = left_pos;
     let right_pos_f = right_pos;
 
-    // x positions broadcasted to (B, T)
     let x_b =
         mlx_rs::ops::broadcast_to_device(&x, &[b, t], mlx_rs::StreamOrDevice::default()).unwrap();
 
-    // Linear interpolation
     let dx = right_pos_f.subtract(&left_pos_f).unwrap();
     let dx_safe = mlx_rs::ops::maximum(&dx, &Array::from(1e-8f32)).unwrap();
 
@@ -885,11 +849,10 @@ fn batch_interp_with_replacement_detach_gpu(uv: &Array, f0: &Array) -> Array {
         )
         .unwrap();
 
-    // Where voiced (not uv), use original f0; where unvoiced, use interp
     mlx_rs::ops::r#where(uv, &interp, f0).unwrap()
 }
 
-pub fn postprocess_f0(f0: &Array, f0_min: f32, f0_max: Option<f32>, interp_uv: bool) -> Array {
+pub fn postprocess_f0(f0: &Array, f0_min: f32, f0_max: Option<f32>, interp_uv: bool) -> (Array, Array) {
     let mut f0 = f0.clone();
 
     let uv = mlx_rs::ops::lt(&f0, &Array::from(f0_min)).unwrap();
@@ -916,5 +879,5 @@ pub fn postprocess_f0(f0: &Array, f0_min: f32, f0_max: Option<f32>, interp_uv: b
         .unwrap();
     }
 
-    f0
+    (f0, uv_float)
 }
