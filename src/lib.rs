@@ -6,6 +6,7 @@ use mlx_rs::ops::{
     as_strided, concatenate_axis, le, maximum, minimum, pad, sqrt, square, transpose_axes, which,
 };
 use mlx_rs::{Array, array};
+use ndarray::{Array1, Array2};
 use safetensors::SafeTensors;
 use safetensors::tensor::TensorView;
 use std::collections::HashMap;
@@ -325,18 +326,16 @@ fn mel_to_hz(mel: f32) -> f32 {
     }
 }
 
-fn fft_frequencies(sr: f32, n_fft: i32) -> Vec<f32> {
+fn fft_frequencies(sr: f32, n_fft: i32) -> Array1<f32> {
     let n = (n_fft / 2 + 1) as usize;
-    (0..n).map(|i| i as f32 * sr / n_fft as f32).collect()
+    Array1::from_iter((0..n).map(|i| i as f32 * sr / n_fft as f32))
 }
 
-fn mel_frequencies(n_mels: i32, fmin: f32, fmax: f32) -> Vec<f32> {
+fn mel_frequencies(n_mels: i32, fmin: f32, fmax: f32) -> Array1<f32> {
     let min_mel = hz_to_mel(fmin);
     let max_mel = hz_to_mel(fmax);
     let step = (max_mel - min_mel) / (n_mels - 1) as f32;
-    (0..n_mels)
-        .map(|i| mel_to_hz(min_mel + step * i as f32))
-        .collect()
+    Array1::from_iter((0..n_mels).map(|i| mel_to_hz(min_mel + step * i as f32)))
 }
 
 pub fn build_mel_filterbank(sr: f32, n_fft: i32, n_mels: i32, fmin: f32, fmax: f32) -> Array {
@@ -344,7 +343,7 @@ pub fn build_mel_filterbank(sr: f32, n_fft: i32, n_mels: i32, fmin: f32, fmax: f
     let fftfreqs = fft_frequencies(sr, n_fft);
     let mel_f = mel_frequencies(n_mels + 2, fmin, fmax);
 
-    let mut weights = vec![0.0f32; (n_mels as usize) * n_freqs];
+    let mut weights = Array2::<f32>::zeros((n_mels as usize, n_freqs));
 
     for i in 0..n_mels as usize {
         let fdiff_lower = mel_f[i + 1] - mel_f[i];
@@ -354,32 +353,32 @@ pub fn build_mel_filterbank(sr: f32, n_fft: i32, n_mels: i32, fmin: f32, fmax: f
             let lower = -(mel_f[i] - fftfreqs[j]) / fdiff_lower;
             let upper = (mel_f[i + 2] - fftfreqs[j]) / fdiff_upper;
             let w = lower.min(upper).max(0.0);
-            weights[i * n_freqs + j] = w;
+            weights[[i, j]] = w;
         }
 
         // Slaney normalization
         let enorm = 2.0f32 / (mel_f[i + 2] - mel_f[i]);
         for j in 0..n_freqs {
-            weights[i * n_freqs + j] *= enorm;
+            weights[[i, j]] *= enorm;
         }
     }
 
-    Array::from_slice(&weights, &[n_mels, n_freqs as i32])
+    Array::from_slice(weights.as_slice().unwrap(), &[n_mels, n_freqs as i32])
 }
 
 pub fn build_hann_window(size: i32) -> Array {
     // Match PyTorch torch.hann_window(size, periodic=True)
-    let data: Vec<f32> = (0..size)
-        .map(|i| 0.5f32 * (1.0f32 - (2.0f32 * std::f32::consts::PI * i as f32 / size as f32).cos()))
-        .collect();
-    Array::from_slice(&data, &[size])
+    let data: Array1<f32> = Array1::from_iter((0..size).map(|i| {
+        0.5f32 * (1.0f32 - (2.0f32 * std::f32::consts::PI * i as f32 / size as f32).cos())
+    }));
+    Array::from_slice(data.as_slice().unwrap(), &[size])
 }
 
 fn compute_resample_kernel(
     input: &[f32],
     input_sr: usize,
     output_sr: usize,
-) -> Option<(Vec<f32>, Vec<Vec<f32>>, usize, usize, usize, usize, usize)> {
+) -> Option<(Array1<f32>, Array2<f32>, usize, usize, usize, usize, usize)> {
     if input_sr == output_sr {
         return None;
     }
@@ -405,7 +404,7 @@ fn compute_resample_kernel(
 
     let kernel_len = (2 * width + orig_freq as i32) as usize;
     let new_freq_i = new_freq as usize;
-    let mut kernel = vec![vec![0.0f64; kernel_len]; new_freq_i];
+    let mut kernel = Array2::<f64>::zeros((new_freq_i, kernel_len));
 
     for j in 0..new_freq_i {
         let t_offset = -(j as f64) / new_freq;
@@ -424,7 +423,7 @@ fn compute_resample_kernel(
                 t_pi.sin() / t_pi
             };
             let scale = base_freq / orig_freq;
-            kernel[j][k] = sinc * window * scale;
+            kernel[[j, k]] = sinc * window * scale;
         }
     }
 
@@ -435,13 +434,12 @@ fn compute_resample_kernel(
     let output_len = (padded_len - kernel_len) / orig_freq as usize + 1;
     let target_len = ((new_freq * input_len as f64) / orig_freq).ceil() as usize;
 
-    let mut padded = vec![0.0f32; padded_len];
-    padded[pad_left..pad_left + input_len].copy_from_slice(input);
+    let mut padded = Array1::<f32>::zeros(padded_len);
+    padded
+        .slice_mut(ndarray::s![pad_left..pad_left + input_len])
+        .assign(&Array1::from_iter(input.iter().copied()));
 
-    let kernel_f32: Vec<Vec<f32>> = kernel
-        .iter()
-        .map(|kj| kj.iter().map(|&v| v as f32).collect())
-        .collect();
+    let kernel_f32: Array2<f32> = kernel.mapv(|v| v as f32);
 
     Some((
         padded,
@@ -476,16 +474,16 @@ pub fn resample_audio(input: &[f32], input_sr: usize, output_sr: usize) -> Vec<f
             );
         }
 
-        let mut output = vec![0.0f32; target_len];
-        let mut temp = vec![vec![0.0f32; output_len]; new_freq_i];
+        let mut output = Array1::<f32>::zeros(target_len);
+        let mut temp = Array2::<f32>::zeros((new_freq_i, output_len));
 
         for j in 0..new_freq_i {
             unsafe {
                 vDSP_desamp(
                     padded.as_ptr(),
                     orig_freq as isize,
-                    kernel_f32[j].as_ptr(),
-                    temp[j].as_mut_ptr(),
+                    kernel_f32.row(j).as_ptr(),
+                    temp.row_mut(j).as_mut_ptr(),
                     output_len,
                     kernel_len,
                 );
@@ -496,17 +494,17 @@ pub fn resample_audio(input: &[f32], input_sr: usize, output_sr: usize) -> Vec<f
             for j in 0..new_freq_i {
                 let idx = i * new_freq_i + j;
                 if idx < target_len {
-                    output[idx] = temp[j][i];
+                    output[idx] = temp[[j, i]];
                 }
             }
         }
 
-        output
+        output.to_vec()
     }
 
     #[cfg(not(target_os = "macos"))]
     {
-        let mut output = vec![0.0f32; target_len];
+        let mut output = Array1::<f32>::zeros(target_len);
 
         for i in 0..output_len {
             let start = i * orig_freq;
@@ -517,13 +515,13 @@ pub fn resample_audio(input: &[f32], input_sr: usize, output_sr: usize) -> Vec<f
                 }
                 let mut sum = 0.0f64;
                 for k in 0..kernel_len {
-                    sum += padded[start + k] as f64 * kernel_f32[j][k] as f64;
+                    sum += padded[start + k] as f64 * kernel_f32[[j, k]] as f64;
                 }
                 output[out_idx] = sum as f32;
             }
         }
 
-        output
+        output.to_vec()
     }
 }
 
@@ -564,10 +562,7 @@ pub fn resample_audio_metal(input: &[f32], input_sr: usize, output_sr: usize) ->
         metal::MTLResourceOptions::StorageModeShared,
     );
 
-    let kernel_flat: Vec<f32> = kernel_f32
-        .iter()
-        .flat_map(|row| row.iter().copied())
-        .collect();
+    let kernel_flat: Vec<f32> = kernel_f32.iter().copied().collect();
     let kernel_buffer = device.new_buffer_with_data(
         kernel_flat.as_ptr() as *const _,
         (kernel_flat.len() * std::mem::size_of::<f32>()) as u64,
@@ -852,7 +847,12 @@ fn batch_interp_with_replacement_detach_gpu(uv: &Array, f0: &Array) -> Array {
     mlx_rs::ops::r#where(uv, &interp, f0).unwrap()
 }
 
-pub fn postprocess_f0(f0: &Array, f0_min: f32, f0_max: Option<f32>, interp_uv: bool) -> (Array, Array) {
+pub fn postprocess_f0(
+    f0: &Array,
+    f0_min: f32,
+    f0_max: Option<f32>,
+    interp_uv: bool,
+) -> (Array, Array) {
     let mut f0 = f0.clone();
 
     let uv = mlx_rs::ops::lt(&f0, &Array::from(f0_min)).unwrap();

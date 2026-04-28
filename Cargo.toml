@@ -12,6 +12,7 @@ anyhow = "1.0"
 hound = "3.5"
 safetensors = "0.7.0"
 metal = "0.33.0"
+ndarray = "0.17.2"
 
 [[example]]
 name = "infer"
