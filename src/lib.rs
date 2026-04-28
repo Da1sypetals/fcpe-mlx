@@ -10,6 +10,7 @@ use ndarray::{Array1, Array2};
 use safetensors::SafeTensors;
 use safetensors::tensor::TensorView;
 use std::collections::HashMap;
+use std::path::Path;
 
 pub fn tensor_to_array(tensor: &TensorView) -> Array {
     let shape: Vec<i32> = tensor.shape().iter().map(|&s| s as i32).collect();
@@ -17,18 +18,6 @@ pub fn tensor_to_array(tensor: &TensorView) -> Array {
     let f32_slice: &[f32] =
         unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, data.len() / 4) };
     Array::from_slice(f32_slice, &shape)
-}
-
-pub fn load_weights_safetensors(path: &str) -> HashMap<String, Array> {
-    let data = std::fs::read(path).unwrap();
-    let tensors = SafeTensors::deserialize(&data).unwrap();
-    let mut weights = HashMap::new();
-    for name in tensors.names() {
-        let tensor = tensors.tensor(name).unwrap();
-        let arr = tensor_to_array(&tensor);
-        weights.insert(name.to_string(), arr);
-    }
-    weights
 }
 
 fn get_weight(weights: &HashMap<String, Array>, key: &str) -> Array {
@@ -110,7 +99,16 @@ pub struct CFNaiveMelPE {
 }
 
 impl CFNaiveMelPE {
-    pub fn new(weights: HashMap<String, Array>) -> Self {
+    pub fn load<P: AsRef<Path>>(path: P) -> Self {
+        let data = std::fs::read(path).unwrap();
+        let tensors = SafeTensors::deserialize(&data).unwrap();
+        let mut weights = HashMap::new();
+        for name in tensors.names() {
+            let tensor = tensors.tensor(name).unwrap();
+            let arr = tensor_to_array(&tensor);
+            weights.insert(name.to_string(), arr);
+        }
+
         let hidden_dims = 512;
         let out_dims = 360;
         let n_layers = 6;
@@ -120,8 +118,7 @@ impl CFNaiveMelPE {
 
         let mut input_conv1 = Conv1d::new(input_channels, hidden_dims, 3).unwrap();
         input_conv1.padding = 1;
-        input_conv1.weight.value =
-            transpose_axes(&get_weight(&weights, "input_stack_0_weight"), &[0, 2, 1]).unwrap();
+        input_conv1.weight.value = get_weight(&weights, "input_stack_0_weight");
         input_conv1.bias.value = Some(get_weight(&weights, "input_stack_0_bias"));
 
         let mut input_gn = GroupNorm::new(4, hidden_dims).unwrap();
@@ -131,8 +128,7 @@ impl CFNaiveMelPE {
 
         let mut input_conv2 = Conv1d::new(hidden_dims, hidden_dims, 3).unwrap();
         input_conv2.padding = 1;
-        input_conv2.weight.value =
-            transpose_axes(&get_weight(&weights, "input_stack_3_weight"), &[0, 2, 1]).unwrap();
+        input_conv2.weight.value = get_weight(&weights, "input_stack_3_weight");
         input_conv2.bias.value = Some(get_weight(&weights, "input_stack_3_bias"));
 
         let mut conformer_layers = Vec::new();
@@ -151,29 +147,20 @@ impl CFNaiveMelPE {
                 &weights,
                 &format!("{}_conformer_net_0_bias", prefix),
             ));
-            cm.conv1.weight.value = transpose_axes(
-                &get_weight(&weights, &format!("{}_conformer_net_2_weight", prefix)),
-                &[0, 2, 1],
-            )
-            .unwrap();
+            cm.conv1.weight.value =
+                get_weight(&weights, &format!("{}_conformer_net_2_weight", prefix));
             cm.conv1.bias.value = Some(get_weight(
                 &weights,
                 &format!("{}_conformer_net_2_bias", prefix),
             ));
-            cm.dw_conv.weight.value = transpose_axes(
-                &get_weight(&weights, &format!("{}_conformer_net_4_conv_weight", prefix)),
-                &[0, 2, 1],
-            )
-            .unwrap();
+            cm.dw_conv.weight.value =
+                get_weight(&weights, &format!("{}_conformer_net_4_conv_weight", prefix));
             cm.dw_conv.bias.value = Some(get_weight(
                 &weights,
                 &format!("{}_conformer_net_4_conv_bias", prefix),
             ));
-            cm.conv2.weight.value = transpose_axes(
-                &get_weight(&weights, &format!("{}_conformer_net_6_weight", prefix)),
-                &[0, 2, 1],
-            )
-            .unwrap();
+            cm.conv2.weight.value =
+                get_weight(&weights, &format!("{}_conformer_net_6_weight", prefix));
             cm.conv2.bias.value = Some(get_weight(
                 &weights,
                 &format!("{}_conformer_net_6_bias", prefix),
