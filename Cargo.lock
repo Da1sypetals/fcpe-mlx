@@ -470,7 +470,7 @@ checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 [[package]]
 name = "mlx-internal-macros"
 version = "0.25.3"
-source = "git+https://github.com/blossom-slopware/mlx-rs.git?rev=b81194a47c2c6ba4ecb0cf370e4f0d941f52dd5d#b81194a47c2c6ba4ecb0cf370e4f0d941f52dd5d"
+source = "git+https://github.com/blossom-slopware/mlx-rs.git?rev=b9a843246bc494da02d680835e6c29c1056835b0#b9a843246bc494da02d680835e6c29c1056835b0"
 dependencies = [
  "darling",
  "itertools 0.14.0",
@@ -482,7 +482,7 @@ dependencies = [
 [[package]]
 name = "mlx-macros"
 version = "0.25.3"
-source = "git+https://github.com/blossom-slopware/mlx-rs.git?rev=b81194a47c2c6ba4ecb0cf370e4f0d941f52dd5d#b81194a47c2c6ba4ecb0cf370e4f0d941f52dd5d"
+source = "git+https://github.com/blossom-slopware/mlx-rs.git?rev=b9a843246bc494da02d680835e6c29c1056835b0#b9a843246bc494da02d680835e6c29c1056835b0"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -493,7 +493,7 @@ dependencies = [
 [[package]]
 name = "mlx-rs"
 version = "0.25.3"
-source = "git+https://github.com/blossom-slopware/mlx-rs.git?rev=b81194a47c2c6ba4ecb0cf370e4f0d941f52dd5d#b81194a47c2c6ba4ecb0cf370e4f0d941f52dd5d"
+source = "git+https://github.com/blossom-slopware/mlx-rs.git?rev=b9a843246bc494da02d680835e6c29c1056835b0#b9a843246bc494da02d680835e6c29c1056835b0"
 dependencies = [
  "dyn-clone",
  "half",
@@ -516,7 +516,7 @@ dependencies = [
 [[package]]
 name = "mlx-sys"
 version = "0.2.0"
-source = "git+https://github.com/blossom-slopware/mlx-rs.git?rev=b81194a47c2c6ba4ecb0cf370e4f0d941f52dd5d#b81194a47c2c6ba4ecb0cf370e4f0d941f52dd5d"
+source = "git+https://github.com/blossom-slopware/mlx-rs.git?rev=b9a843246bc494da02d680835e6c29c1056835b0#b9a843246bc494da02d680835e6c29c1056835b0"
 dependencies = [
  "bindgen",
  "cc",
