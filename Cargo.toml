@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-mlx-rs = { git = "https://github.com/blossom-slopware/mlx-rs.git", rev = "b81194a47c2c6ba4ecb0cf370e4f0d941f52dd5d", features = [
+mlx-rs = { git = "https://github.com/blossom-slopware/mlx-rs.git", rev = "b9a843246bc494da02d680835e6c29c1056835b0", features = [
     "accelerate",
     "metal",
 ] }
